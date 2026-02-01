@@ -23,3 +23,14 @@ Not intended for daily or production use.
 ## License
 This is an **open-source** project.  
 See the repository for license details.
+
+## TODO / Roadmap
+
+### 🇬🇧 English
+- [ ] Basic CLI menu
+- [ ] Disk selection and partitioning
+- [ ] Gentoo base system installation
+- [ ] fstab configuration
+- [ ] User and root password setup
+- [ ] Error handling
+- [ ] Virtual machine testing
