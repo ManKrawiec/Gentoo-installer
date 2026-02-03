@@ -11,6 +11,7 @@ import curses
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
 import sys
 from typing import Dict, List
@@ -71,6 +72,9 @@ class GentooInstallConfig:
                 self.network_mode,
             ]
         )
+
+
+GENTOO_ROOT = "/mnt/gentoo"
 
 
 DESKTOP_PROFILES: Dict[str, DesktopProfile] = {
@@ -170,6 +174,124 @@ def run_cmd(cmd: List[str], dry_run: bool) -> None:
         return
 
     subprocess.run(cmd, check=True)
+
+
+def run_cmd_capture(cmd: List[str]) -> subprocess.CompletedProcess:
+    """Run a command and return the CompletedProcess (stdout/stderr captured).
+
+    This helper never prints; callers are responsible for logging.
+    """
+
+    return subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
+def run_in_chroot(cmd: List[str], dry_run: bool, root: str = GENTOO_ROOT) -> None:
+    """Execute a command inside the Gentoo chroot.
+
+    Assumes that GENTOO_ROOT contains a valid stage3 and bind mounts.
+    """
+
+    chroot_cmd = ["chroot", root] + cmd
+    run_cmd(chroot_cmd, dry_run=dry_run)
+
+
+def setup_chroot_mounts(dry_run: bool, root: str = GENTOO_ROOT) -> None:
+    """Bind-mount host pseudo filesystems into the chroot.
+
+    This mirrors the standard Gentoo installation handbook procedure.
+    """
+
+    mounts = [
+        ["mount", "--types", "proc", "/proc", os.path.join(root, "proc")],
+        ["mount", "--rbind", "/sys", os.path.join(root, "sys")],
+        ["mount", "--make-rslave", os.path.join(root, "sys")],
+        ["mount", "--rbind", "/dev", os.path.join(root, "dev")],
+        ["mount", "--make-rslave", os.path.join(root, "dev")],
+        ["mount", "--rbind", "/run", os.path.join(root, "run")],
+        ["mount", "--make-rslave", os.path.join(root, "run")],
+    ]
+    for cmd in mounts:
+        run_cmd(cmd, dry_run=dry_run)
+
+
+def generate_fstab(cfg: GentooInstallConfig, dry_run: bool, root: str = GENTOO_ROOT) -> None:
+    """Generate a basic /etc/fstab for the target system.
+
+    Uses findmnt/blkid to create UUID-based entries for currently mounted
+    filesystems under GENTOO_ROOT plus the configured swap partition.
+    """
+
+    etc_dir = os.path.join(root, "etc")
+    fstab_path = os.path.join(etc_dir, "fstab")
+    os.makedirs(etc_dir, exist_ok=True)
+
+    print(f"[STEP] Generating fstab at {fstab_path}")
+
+    lines: list[str] = []
+
+    # Filesystems mounted under root (/, /boot, etc.)
+    try:
+        result = run_cmd_capture([
+            "findmnt",
+            "-R",
+            "-no",
+            "SOURCE,TARGET,FSTYPE,UUID",
+            root,
+        ])
+        for raw_line in result.stdout.splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            parts = raw_line.split()
+            if len(parts) != 4:
+                continue
+            source, target, fstype, uuid = parts
+            if not uuid or not fstype:
+                continue
+            # Map absolute target to mountpoint inside the new system
+            if not target.startswith(root):
+                continue
+            rel = target[len(root) :]
+            mountpoint = rel if rel else "/"
+            passno = "1" if mountpoint == "/" else "2"
+            line = f"UUID={uuid} {mountpoint} {fstype} defaults 0 {passno}"
+            lines.append(line)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Could not auto-generate fstab from findmnt: {exc!r}")
+
+    # Swap partition from config (might not be mounted)
+    if cfg.swap_partition:
+        try:
+            res = run_cmd_capture([
+                "blkid",
+                "-s",
+                "UUID",
+                "-o",
+                "value",
+                cfg.swap_partition,
+            ])
+            swap_uuid = res.stdout.strip()
+            if swap_uuid:
+                lines.append(f"UUID={swap_uuid} none swap sw 0 0")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Could not determine UUID for swap {cfg.swap_partition}: {exc!r}")
+
+    if not lines:
+        print("[WARN] No fstab entries were generated.")
+        return
+
+    content = "\n".join(lines) + "\n"
+    print("[INFO] fstab entries that will be written:")
+    for l in lines:
+        print("  ", l)
+
+    if dry_run:
+        print("[INFO] Dry-run: not writing fstab file.")
+        return
+
+    with open(fstab_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print("[OK] fstab written.")
 
 
 def list_disks() -> list[dict]:
@@ -1032,14 +1154,14 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
             sys.exit(1)
         print("Using existing partitions (manual mode); partition table will NOT be modified.")
         cmds: list[list[str]] = [
-            ["mkdir", "-p", "/mnt/gentoo"],
-            ["mount", cfg.root_partition, "/mnt/gentoo"],
+            ["mkdir", "-p", GENTOO_ROOT],
+            ["mount", cfg.root_partition, GENTOO_ROOT],
         ]
         if cfg.boot_partition:
             cmds.extend(
                 [
-                    ["mkdir", "-p", "/mnt/gentoo/boot"],
-                    ["mount", cfg.boot_partition, "/mnt/gentoo/boot"],
+                    ["mkdir", "-p", os.path.join(GENTOO_ROOT, "boot")],
+                    ["mount", cfg.boot_partition, os.path.join(GENTOO_ROOT, "boot")],
                 ]
             )
         for cmd in cmds:
@@ -1087,10 +1209,10 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
             ["mkfs.vfat", "-F32", boot_part],
             ["mkfs.ext4", root_part],
             # Mount points
-            ["mkdir", "-p", "/mnt/gentoo"],
-            ["mount", root_part, "/mnt/gentoo"],
-            ["mkdir", "-p", "/mnt/gentoo/boot"],
-            ["mount", boot_part, "/mnt/gentoo/boot"],
+            ["mkdir", "-p", GENTOO_ROOT],
+            ["mount", root_part, GENTOO_ROOT],
+            ["mkdir", "-p", os.path.join(GENTOO_ROOT, "boot")],
+            ["mount", boot_part, os.path.join(GENTOO_ROOT, "boot")],
         ]
     else:
         print("Planning BIOS/MBR layout with single ext4 root on", cfg.target_disk)
@@ -1109,8 +1231,8 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
                 "100%",
             ],
             ["mkfs.ext4", root_part],
-            ["mkdir", "-p", "/mnt/gentoo"],
-            ["mount", root_part, "/mnt/gentoo"],
+            ["mkdir", "-p", GENTOO_ROOT],
+            ["mount", root_part, GENTOO_ROOT],
         ]
 
     for cmd in cmds:
@@ -1118,14 +1240,62 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
 
 
 def install_stage3(cfg: GentooInstallConfig, dry_run: bool) -> None:
-    print("\n[STEP] Installing stage3 (stub)")
-    print("TODO: download latest stage3 tarball and extract it to /mnt/gentoo")
-    run_cmd(["echo", "would download and extract stage3"], dry_run)
+    """Install Gentoo stage3 into GENTOO_ROOT.
+
+    For safety and flexibility we expect the user (or environment) to provide
+    the path to a stage3 tarball via the GENTOO_STAGE3_TARBALL environment
+    variable. This keeps URL logic out of the installer and works with both
+    locally downloaded and mirrored tarballs.
+    """
+
+    print("\n[STEP] Installing stage3")
+
+    # Ensure target directory exists
+    os.makedirs(GENTOO_ROOT, exist_ok=True)
+
+    tarball = os.environ.get("GENTOO_STAGE3_TARBALL")
+    if not tarball:
+        print(
+            "[WARN] GENTOO_STAGE3_TARBALL is not set. "
+            "Place a stage3 tarball somewhere and set this environment variable "
+            "to its full path before running with --execute. Skipping extraction.",
+        )
+        return
+
+    if not os.path.exists(tarball):
+        print(f"[ERROR] Stage3 tarball not found: {tarball}")
+        sys.exit(1)
+
+    # If directory is not empty, warn but continue – user might be resuming.
+    if not dry_run and os.listdir(GENTOO_ROOT):
+        print(f"[WARN] {GENTOO_ROOT} is not empty – stage3 will be extracted on top.")
+
+    cmd = [
+        "tar",
+        "xpf",
+        tarball,
+        "-C",
+        GENTOO_ROOT,
+        "--xattrs-include=*",
+        "--numeric-owner",
+    ]
+    run_cmd(cmd, dry_run=dry_run)
+
+    # After root filesystem is in place and mounts exist, generate fstab skeleton.
+    generate_fstab(cfg, dry_run=dry_run, root=GENTOO_ROOT)
 
 
 def configure_base_system(cfg: GentooInstallConfig, dry_run: bool) -> None:
-    print("\n[STEP] Configuring base system (stub)")
-    print("TODO: chroot, configure make.conf, timezone, locales, kernel, etc.")
+    print("\n[STEP] Configuring base system (partial implementation)")
+    print("Setting up chroot mounts and preparing for further configuration.")
+
+    # Bind-mount /dev, /proc, /sys, /run into the stage3 root so that
+    # subsequent chrooted commands behave like a normal system.
+    setup_chroot_mounts(dry_run=dry_run, root=GENTOO_ROOT)
+
+    # TODO: inside the chroot we should configure make.conf, profiles, locale,
+    # timezone, kernel build method based on cfg.kernel, and network based on
+    # cfg.network_mode. For now we just log the intended choices.
     print(f"Selected kernel mode: {cfg.kernel}")
     print(f"Network mode: {cfg.network_mode}")
     run_cmd(["echo", "would configure base Gentoo system"], dry_run)
