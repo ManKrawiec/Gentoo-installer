@@ -30,6 +30,10 @@ class GentooInstallConfig:
     language: str = "en_US"
     # Stage3
     stage3_source: str | None = None  # local path or URL; optional if env var is used
+    # Build options
+    makeopts_jobs: int | None = None  # value for -j in MAKEOPTS
+    features_parallel_fetch: bool = True
+    emerge_keep_going: bool = False
     # Disk configuration
     target_disk: str | None = None
     disk_mode: str = "auto"  # "auto" = wipe and create layout, "manual" = use existing partitions
@@ -352,6 +356,7 @@ def list_disks() -> list[dict]:
 TUI_STEPS = [
     "Language",
     "Stage3 source",
+    "Build options",
     "Disk configuration",
     "Swap",
     "Hostname",
@@ -385,27 +390,30 @@ def _tui_draw_main(stdscr, current_idx: int, cfg: GentooInstallConfig, message: 
     lang_label = LANGUAGES.get(cfg.language, cfg.language)
     stdscr.addstr(5, x0, f"Language  : {lang_label or '-'}")
     stdscr.addstr(6, x0, f"Stage3    : {cfg.stage3_source or os.environ.get('GENTOO_STAGE3_TARBALL', '-')}")
-    stdscr.addstr(7, x0, f"Disk      : {cfg.target_disk or '-'}")
-    stdscr.addstr(8, x0, f"Disk mode : {cfg.disk_mode}")
-    stdscr.addstr(9, x0, f"Root part.: {cfg.root_partition or '-'}")
-    stdscr.addstr(10, x0, f"Boot part.: {cfg.boot_partition or '-'}")
-    stdscr.addstr(11, x0, f"Swap part.: {cfg.swap_partition or '-'}")
-    stdscr.addstr(12, x0, f"Root FS   : {cfg.root_fs or '-'}")
-    stdscr.addstr(13, x0, f"UEFI      : " + ("yes" if cfg.use_uefi else "no" if cfg.use_uefi is not None else "-"))
-    stdscr.addstr(14, x0, f"Hostname  : {cfg.hostname or '-'}")
-    stdscr.addstr(15, x0, f"User      : {cfg.username or '-'}")
-    stdscr.addstr(16, x0, f"Root pwd  : {'set' if cfg.root_password else 'NOT set'}")
-    stdscr.addstr(17, x0, f"User pwd  : {'set' if cfg.user_password else 'NOT set'}")
-    stdscr.addstr(18, x0, f"User sudo : {'yes' if cfg.user_is_sudoer else 'no'}")
-    stdscr.addstr(19, x0, f"Desktop   : {cfg.desktop_profile or '-'}")
-    stdscr.addstr(20, x0, f"Bootloader: {cfg.bootloader or '-'}")
-    stdscr.addstr(21, x0, f"Kernel    : {cfg.kernel or '-'}")
-    stdscr.addstr(22, x0, f"Network   : {cfg.network_mode or '-'}")
+    stdscr.addstr(7, x0, f"MAKEOPTS  : -j{cfg.makeopts_jobs}" if cfg.makeopts_jobs else "MAKEOPTS  : (auto)")
+    stdscr.addstr(8, x0, f"parallel-fetch : {'on' if cfg.features_parallel_fetch else 'off'}")
+    stdscr.addstr(9, x0, f"keep-going     : {'on' if cfg.emerge_keep_going else 'off'}")
+    stdscr.addstr(10, x0, f"Disk      : {cfg.target_disk or '-'}")
+    stdscr.addstr(11, x0, f"Disk mode : {cfg.disk_mode}")
+    stdscr.addstr(12, x0, f"Root part.: {cfg.root_partition or '-'}")
+    stdscr.addstr(13, x0, f"Boot part.: {cfg.boot_partition or '-'}")
+    stdscr.addstr(14, x0, f"Swap part.: {cfg.swap_partition or '-'}")
+    stdscr.addstr(15, x0, f"Root FS   : {cfg.root_fs or '-'}")
+    stdscr.addstr(16, x0, f"UEFI      : " + ("yes" if cfg.use_uefi else "no" if cfg.use_uefi is not None else "-"))
+    stdscr.addstr(17, x0, f"Hostname  : {cfg.hostname or '-'}")
+    stdscr.addstr(18, x0, f"User      : {cfg.username or '-'}")
+    stdscr.addstr(19, x0, f"Root pwd  : {'set' if cfg.root_password else 'NOT set'}")
+    stdscr.addstr(20, x0, f"User pwd  : {'set' if cfg.user_password else 'NOT set'}")
+    stdscr.addstr(21, x0, f"User sudo : {'yes' if cfg.user_is_sudoer else 'no'}")
+    stdscr.addstr(22, x0, f"Desktop   : {cfg.desktop_profile or '-'}")
+    stdscr.addstr(23, x0, f"Bootloader: {cfg.bootloader or '-'}")
+    stdscr.addstr(24, x0, f"Kernel    : {cfg.kernel or '-'}")
+    stdscr.addstr(25, x0, f"Network   : {cfg.network_mode or '-'}")
 
     if cfg.is_complete():
-        stdscr.addstr(24, x0, "Config status: COMPLETE", curses.color_pair(0) | curses.A_BOLD)
+        stdscr.addstr(25, x0, "Config status: COMPLETE", curses.color_pair(0) | curses.A_BOLD)
     else:
-        stdscr.addstr(24, x0, "Config status: incomplete", curses.A_DIM)
+        stdscr.addstr(25, x0, "Config status: incomplete", curses.A_DIM)
 
     if message:
         stdscr.addstr(h - 2, 2, message[: max(0, w - 4)], curses.A_BOLD)
@@ -1003,6 +1011,56 @@ def _tui_edit_stage3(stdscr, cfg: GentooInstallConfig) -> None:
     cfg.stage3_source = value or None
 
 
+def _tui_edit_build_options(stdscr, cfg: GentooInstallConfig) -> None:
+    """Configure MAKEOPTS (-j) used for compilation.
+
+    If left empty, a sensible default based on CPU count will be used.
+    """
+
+    default_jobs = cfg.makeopts_jobs or (os.cpu_count() or 2)
+    val = _tui_prompt_input(
+        stdscr,
+        "Build options",
+        "Number of jobs for MAKEOPTS (-j)",
+        str(default_jobs),
+    )
+    if not val:
+        cfg.makeopts_jobs = None
+    elif val.isdigit() and int(val) > 0:
+        cfg.makeopts_jobs = int(val)
+
+    # Toggles for FEATURES and EMERGE_DEFAULT_OPTS
+    # parallel-fetch
+    pf_default = "y" if cfg.features_parallel_fetch else "n"
+    pf_ans = _tui_prompt_input(
+        stdscr,
+        "Build options",
+        "Enable FEATURES=parallel-fetch? [y/n]",
+        pf_default,
+    )
+    if pf_ans:
+        pf_ans_l = pf_ans.lower()
+        if pf_ans_l.startswith("y"):
+            cfg.features_parallel_fetch = True
+        elif pf_ans_l.startswith("n"):
+            cfg.features_parallel_fetch = False
+
+    # emerge --keep-going
+    kg_default = "y" if cfg.emerge_keep_going else "n"
+    kg_ans = _tui_prompt_input(
+        stdscr,
+        "Build options",
+        "Enable emerge --keep-going by default? [y/n]",
+        kg_default,
+    )
+    if kg_ans:
+        kg_ans_l = kg_ans.lower()
+        if kg_ans_l.startswith("y"):
+            cfg.emerge_keep_going = True
+        elif kg_ans_l.startswith("n"):
+            cfg.emerge_keep_going = False
+
+
 def tui_main(stdscr, cfg: GentooInstallConfig, dry_run: bool) -> bool:
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -1029,6 +1087,8 @@ def tui_main(stdscr, cfg: GentooInstallConfig, dry_run: bool) -> bool:
                 _tui_edit_language(stdscr, cfg)
             elif step == "Stage3 source":
                 _tui_edit_stage3(stdscr, cfg)
+            elif step == "Build options":
+                _tui_edit_build_options(stdscr, cfg)
             elif step == "Disk configuration":
                 _tui_edit_disk(stdscr, cfg)
             elif step == "Swap":
@@ -1355,30 +1415,166 @@ def install_stage3(cfg: GentooInstallConfig, dry_run: bool) -> None:
 
 
 def configure_base_system(cfg: GentooInstallConfig, dry_run: bool) -> None:
-    print("\n[STEP] Configuring base system (partial implementation)")
-    print("Setting up chroot mounts and preparing for further configuration.")
+    print("\\n[STEP] Configuring base system")
+    print("Setting up chroot mounts and basic system configuration.")
 
     # Bind-mount /dev, /proc, /sys, /run into the stage3 root so that
     # subsequent chrooted commands behave like a normal system.
     setup_chroot_mounts(dry_run=dry_run, root=GENTOO_ROOT)
 
-    # TODO: inside the chroot we should configure make.conf, profiles, locale,
-    # timezone, kernel build method based on cfg.kernel, and network based on
-    # cfg.network_mode. For now we just log the intended choices.
-    print(f"Selected kernel mode: {cfg.kernel}")
-    print(f"Network mode: {cfg.network_mode}")
-    run_cmd(["echo", "would configure base Gentoo system"], dry_run)
+    # --- resolv.conf ---
+    host_resolv = "/etc/resolv.conf"
+    target_resolv = os.path.join(GENTOO_ROOT, "etc", "resolv.conf")
+    if os.path.exists(host_resolv):
+        print(f"[STEP] Copying {host_resolv} -> {target_resolv}")
+        if not dry_run:
+            os.makedirs(os.path.dirname(target_resolv), exist_ok=True)
+            shutil.copy2(host_resolv, target_resolv)
+
+    # --- hostname & hosts ---
+    if cfg.hostname:
+        hostname_path = os.path.join(GENTOO_ROOT, "etc", "hostname")
+        print(f"[STEP] Writing hostname to {hostname_path}: {cfg.hostname}")
+        if not dry_run:
+            os.makedirs(os.path.dirname(hostname_path), exist_ok=True)
+            with open(hostname_path, "w", encoding="utf-8") as f:
+                f.write(cfg.hostname + "\n")
+
+        hosts_path = os.path.join(GENTOO_ROOT, "etc", "hosts")
+        hosts_content = (
+            "127.0.0.1\tlocalhost\n"
+            f"127.0.1.1\t{cfg.hostname}\n"
+            "::1\tlocalhost ip6-localhost ip6-loopback\n"
+        )
+        print(f"[STEP] Writing basic hosts file to {hosts_path}")
+        if not dry_run:
+            with open(hosts_path, "w", encoding="utf-8") as f:
+                f.write(hosts_content)
+
+    # --- locale ---
+    # Derive a UTF-8 locale from cfg.language, e.g. pl_PL -> pl_PL.UTF-8
+    lang = cfg.language or "en_US"
+    if "." in lang:
+        locale_id = lang
+    else:
+        locale_id = f"{lang}.UTF-8"
+    locale_gen_line = f"{locale_id} UTF-8\n"
+    locale_gen_path = os.path.join(GENTOO_ROOT, "etc", "locale.gen")
+    print(f"[STEP] Configuring locale {locale_id} in {locale_gen_path}")
+    if not dry_run:
+        os.makedirs(os.path.dirname(locale_gen_path), exist_ok=True)
+        # Overwrite locale.gen with a minimal configuration for simplicity.
+        with open(locale_gen_path, "w", encoding="utf-8") as f:
+            f.write(locale_gen_line)
+
+    run_in_chroot(["locale-gen"], dry_run=dry_run)
+
+    locale_conf_path = os.path.join(GENTOO_ROOT, "etc", "locale.conf")
+    print(f"[STEP] Writing LANG={locale_id} to {locale_conf_path}")
+    if not dry_run:
+        with open(locale_conf_path, "w", encoding="utf-8") as f:
+            f.write(f"LANG={locale_id}\n")
+
+    # --- timezone ---
+    timezone = os.environ.get("GENTOO_TIMEZONE", "UTC")
+    tz_path = os.path.join(GENTOO_ROOT, "etc", "timezone")
+    print(f"[STEP] Setting timezone to {timezone} in {tz_path}")
+    if not dry_run:
+        with open(tz_path, "w", encoding="utf-8") as f:
+            f.write(timezone + "\n")
+    # Some stage3 images require running emerge --config for timezone-data; we
+    # log the command but do not fail if it errors.
+    try:
+        run_in_chroot(["emerge", "--config", "sys-libs/timezone-data"], dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Failed to run timezone-data config: {exc!r}")
+
+    # --- make.conf (MAKEOPTS) ---
+    jobs = cfg.makeopts_jobs or (os.cpu_count() or 2)
+    make_conf_path = os.path.join(GENTOO_ROOT, "etc", "portage", "make.conf")
+    print(f"[STEP] Ensuring MAKEOPTS/FEATURES/EMERGE_DEFAULT_OPTS are present in {make_conf_path}")
+    if not dry_run:
+        os.makedirs(os.path.dirname(make_conf_path), exist_ok=True)
+        with open(make_conf_path, "a", encoding="utf-8") as f:
+            f.write(f"MAKEOPTS=\"-j{jobs}\"\\n")
+
+            emerge_opts: list[str] = [f"--jobs={jobs}", f"--load-average={jobs}"]
+            if cfg.emerge_keep_going:
+                emerge_opts.append("--keep-going")
+            f.write(f"EMERGE_DEFAULT_OPTS=\"{' '.join(emerge_opts)}\"\\n")
+
+            features: list[str] = []
+            if cfg.features_parallel_fetch:
+                features.append("parallel-fetch")
+            if features:
+                f.write(f"FEATURES=\"{' '.join(features)}\"\\n")
+
+    # --- kernel installation according to cfg.kernel ---
+    install_kernel(cfg, dry_run=dry_run)
+
+    print(f"[INFO] Selected kernel mode: {cfg.kernel}")
+    print(f"[INFO] Network mode: {cfg.network_mode}")
+
+
+def install_kernel(cfg: GentooInstallConfig, dry_run: bool) -> None:
+    """Install kernel inside chroot based on cfg.kernel.
+
+    This is a simplified implementation that focuses on the most common
+    approaches. It assumes Portage is usable inside the stage3.
+    """
+
+    mode = cfg.kernel
+    print(f"[STEP] Installing kernel (mode={mode})")
+
+    if mode == "dist-kernel":
+        # Gentoo distributed binary kernel
+        run_in_chroot(["emerge", "--quiet-build=n", "sys-kernel/gentoo-kernel-bin"], dry_run=dry_run)
+    elif mode == "genkernel":
+        run_in_chroot(["emerge", "sys-kernel/gentoo-sources", "sys-kernel/genkernel"], dry_run=dry_run)
+        run_in_chroot(["genkernel", "all"], dry_run=dry_run)
+    elif mode == "manual":
+        run_in_chroot(["emerge", "sys-kernel/gentoo-sources"], dry_run=dry_run)
+        print("[INFO] Manual kernel mode selected – user must configure and build the kernel manually in chroot.")
+    else:
+        print(f"[WARN] Unknown kernel mode: {mode}; skipping kernel installation.")
 
 
 def install_bootloader(cfg: GentooInstallConfig, dry_run: bool) -> None:
-    print("\n[STEP] Installing bootloader (stub)")
+    print("\\n[STEP] Installing bootloader")
     print(f"Selected bootloader: {cfg.bootloader}")
-    print("TODO: install and configure the chosen bootloader.")
-    run_cmd(["echo", "would install bootloader", cfg.bootloader], dry_run)
+
+    if cfg.bootloader == "systemd-boot":
+        if not cfg.use_uefi:
+            print("[WARN] systemd-boot selected but UEFI is disabled; skipping.")
+            return
+        # Install systemd-boot into /boot. Assumes a systemd-based stage3.
+        run_in_chroot(["bootctl", "--path=/boot", "install"], dry_run=dry_run)
+        print("[INFO] systemd-boot installed. Ensure kernel entries exist under /boot/loader/entries.")
+        return
+
+    if cfg.bootloader == "grub":
+        run_in_chroot(["emerge", "sys-boot/grub"], dry_run=dry_run)
+        if cfg.use_uefi:
+            run_in_chroot(
+                [
+                    "grub-install",
+                    "--target=x86_64-efi",
+                    "--efi-directory=/boot",
+                    "--bootloader-id=Gentoo",
+                ],
+                dry_run=dry_run,
+            )
+        else:
+            # BIOS/MBR installation on the whole disk.
+            run_in_chroot(["grub-install", cfg.target_disk], dry_run=dry_run)
+        run_in_chroot(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"], dry_run=dry_run)
+        return
+
+    print("[WARN] Bootloader", cfg.bootloader, "is not yet implemented; skipping.")
 
 
 def install_desktop_environment(cfg: GentooInstallConfig, dry_run: bool) -> None:
-    print("\n[STEP] Installing desktop environment (stub)")
+    print("\\n[STEP] Installing desktop environment")
     profile = DESKTOP_PROFILES.get(cfg.desktop_profile)
     if not profile:
         print(f"Unknown desktop profile: {cfg.desktop_profile}, skipping.")
@@ -1392,19 +1588,88 @@ def install_desktop_environment(cfg: GentooInstallConfig, dry_run: bool) -> None
     print("Packages to install:", ", ".join(profile.packages))
     print("Services to enable:", ", ".join(profile.services) if profile.services else "(none)")
 
-    run_cmd(["echo", "would emerge", *profile.packages], dry_run)
+    if profile.packages:
+        run_in_chroot(["emerge", "--quiet-build=n", *profile.packages], dry_run=dry_run)
+
     for svc in profile.services:
-        run_cmd(["echo", f"would enable service {svc}"], dry_run)
+        # Assume systemd-based services for now.
+        run_in_chroot(["systemctl", "enable", svc], dry_run=dry_run)
+
+
+def _set_password(username: str, password: str, dry_run: bool) -> None:
+    """Set a user's password inside the chroot.
+
+    Uses chpasswd; avoids echoing the password to logs.
+    """
+
+    if not password:
+        return
+
+    cmd = ["chroot", GENTOO_ROOT, "chpasswd"]
+    printable = "chpasswd (stdin redacted)"
+    print(f"[CMD]{' (dry-run)' if dry_run else ''}: {printable}")
+    if dry_run:
+        return
+
+    input_data = f"{username}:{password}\n"
+    subprocess.run(cmd, input=input_data, text=True, check=True)
 
 
 def finalize_install(cfg: GentooInstallConfig, dry_run: bool) -> None:
-    print("\n[STEP] Finalizing installation (stub)")
-    print("TODO: set root password, create user, add user to wheel if requested, enable basic services, configure swap and unmount.")
-    if cfg.swap_partition:
-        print(f"Swap partition selected: {cfg.swap_partition}")
+    print("\\n[STEP] Finalizing installation")
+
+    # --- root password ---
+    if cfg.root_password:
+        _set_password("root", cfg.root_password, dry_run=dry_run)
+
+    # --- main user account ---
+    if cfg.username:
+        print(f"[STEP] Creating user {cfg.username}")
+        run_in_chroot(
+            [
+                "useradd",
+                "-m",
+                "-G",
+                "wheel,audio,video",
+                "-s",
+                "/bin/bash",
+                cfg.username,
+            ],
+            dry_run=dry_run,
+        )
+        if cfg.user_password:
+            _set_password(cfg.username, cfg.user_password, dry_run=dry_run)
+
+    # --- sudoers ---
     if cfg.user_is_sudoer:
-        print("User will be added to wheel/sudo group.")
-    run_cmd(["echo", "would finalize install, set passwords, configure swap and reboot"], dry_run)
+        print("[STEP] Ensuring sudo is installed and wheel group has sudo access")
+        run_in_chroot(["emerge", "--noreplace", "sudo"], dry_run=dry_run)
+        sudoers_d = os.path.join(GENTOO_ROOT, "etc", "sudoers.d")
+        sudoers_path = os.path.join(sudoers_d, "10-wheel")
+        if not dry_run:
+            os.makedirs(sudoers_d, exist_ok=True)
+            with open(sudoers_path, "w", encoding="utf-8") as f:
+                f.write("%wheel ALL=(ALL:ALL) ALL\n")
+
+    # --- network services ---
+    if cfg.network_mode in {"nm_default", "nm_iwd"}:
+        print("[STEP] Installing and enabling NetworkManager")
+        pkgs = ["net-misc/networkmanager"]
+        if cfg.network_mode == "nm_iwd":
+            pkgs.append("net-wireless/iwd")
+        run_in_chroot(["emerge", "--quiet-build=n", *pkgs], dry_run=dry_run)
+        run_in_chroot(["systemctl", "enable", "NetworkManager"], dry_run=dry_run)
+        if cfg.network_mode == "nm_iwd":
+            run_in_chroot(["systemctl", "enable", "iwd"], dry_run=dry_run)
+
+    # Basic time sync service for systemd-based systems.
+    run_in_chroot(["systemctl", "enable", "systemd-timesyncd"], dry_run=dry_run)
+
+    # Swap is already in fstab; we just log it here.
+    if cfg.swap_partition:
+        print(f"[INFO] Swap partition configured: {cfg.swap_partition}")
+
+    print("[INFO] Finalization complete. You can now unmount and reboot into Gentoo.")
 
 
 def run_install(cfg: GentooInstallConfig, dry_run: bool) -> None:
