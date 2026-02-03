@@ -28,12 +28,16 @@ class DesktopProfile:
 @dataclasses.dataclass
 class GentooInstallConfig:
     language: str = "en_US"
+    # Stage3
+    stage3_source: str | None = None  # local path or URL; optional if env var is used
     # Disk configuration
     target_disk: str | None = None
     disk_mode: str = "auto"  # "auto" = wipe and create layout, "manual" = use existing partitions
     root_partition: str | None = None
     boot_partition: str | None = None
     swap_partition: str | None = None
+    # Map partition path -> filesystem to be created (only used in manual mode)
+    format_partitions: Dict[str, str] = dataclasses.field(default_factory=dict)
     root_fs: str = "ext4"
     use_uefi: bool | None = None
     # System
@@ -347,6 +351,7 @@ def list_disks() -> list[dict]:
 
 TUI_STEPS = [
     "Language",
+    "Stage3 source",
     "Disk configuration",
     "Swap",
     "Hostname",
@@ -379,27 +384,28 @@ def _tui_draw_main(stdscr, current_idx: int, cfg: GentooInstallConfig, message: 
     stdscr.addstr(3, x0, "Summary", curses.A_BOLD)
     lang_label = LANGUAGES.get(cfg.language, cfg.language)
     stdscr.addstr(5, x0, f"Language  : {lang_label or '-'}")
-    stdscr.addstr(6, x0, f"Disk      : {cfg.target_disk or '-'}")
-    stdscr.addstr(7, x0, f"Disk mode : {cfg.disk_mode}")
-    stdscr.addstr(8, x0, f"Root part.: {cfg.root_partition or '-'}")
-    stdscr.addstr(9, x0, f"Boot part.: {cfg.boot_partition or '-'}")
-    stdscr.addstr(10, x0, f"Swap part.: {cfg.swap_partition or '-'}")
-    stdscr.addstr(11, x0, f"Root FS   : {cfg.root_fs or '-'}")
-    stdscr.addstr(12, x0, f"UEFI      : " + ("yes" if cfg.use_uefi else "no" if cfg.use_uefi is not None else "-"))
-    stdscr.addstr(13, x0, f"Hostname  : {cfg.hostname or '-'}")
-    stdscr.addstr(14, x0, f"User      : {cfg.username or '-'}")
-    stdscr.addstr(15, x0, f"Root pwd  : {'set' if cfg.root_password else 'NOT set'}")
-    stdscr.addstr(16, x0, f"User pwd  : {'set' if cfg.user_password else 'NOT set'}")
-    stdscr.addstr(17, x0, f"User sudo : {'yes' if cfg.user_is_sudoer else 'no'}")
-    stdscr.addstr(18, x0, f"Desktop   : {cfg.desktop_profile or '-'}")
-    stdscr.addstr(19, x0, f"Bootloader: {cfg.bootloader or '-'}")
-    stdscr.addstr(20, x0, f"Kernel    : {cfg.kernel or '-'}")
-    stdscr.addstr(21, x0, f"Network   : {cfg.network_mode or '-'}")
+    stdscr.addstr(6, x0, f"Stage3    : {cfg.stage3_source or os.environ.get('GENTOO_STAGE3_TARBALL', '-')}")
+    stdscr.addstr(7, x0, f"Disk      : {cfg.target_disk or '-'}")
+    stdscr.addstr(8, x0, f"Disk mode : {cfg.disk_mode}")
+    stdscr.addstr(9, x0, f"Root part.: {cfg.root_partition or '-'}")
+    stdscr.addstr(10, x0, f"Boot part.: {cfg.boot_partition or '-'}")
+    stdscr.addstr(11, x0, f"Swap part.: {cfg.swap_partition or '-'}")
+    stdscr.addstr(12, x0, f"Root FS   : {cfg.root_fs or '-'}")
+    stdscr.addstr(13, x0, f"UEFI      : " + ("yes" if cfg.use_uefi else "no" if cfg.use_uefi is not None else "-"))
+    stdscr.addstr(14, x0, f"Hostname  : {cfg.hostname or '-'}")
+    stdscr.addstr(15, x0, f"User      : {cfg.username or '-'}")
+    stdscr.addstr(16, x0, f"Root pwd  : {'set' if cfg.root_password else 'NOT set'}")
+    stdscr.addstr(17, x0, f"User pwd  : {'set' if cfg.user_password else 'NOT set'}")
+    stdscr.addstr(18, x0, f"User sudo : {'yes' if cfg.user_is_sudoer else 'no'}")
+    stdscr.addstr(19, x0, f"Desktop   : {cfg.desktop_profile or '-'}")
+    stdscr.addstr(20, x0, f"Bootloader: {cfg.bootloader or '-'}")
+    stdscr.addstr(21, x0, f"Kernel    : {cfg.kernel or '-'}")
+    stdscr.addstr(22, x0, f"Network   : {cfg.network_mode or '-'}")
 
     if cfg.is_complete():
-        stdscr.addstr(23, x0, "Config status: COMPLETE", curses.color_pair(0) | curses.A_BOLD)
+        stdscr.addstr(24, x0, "Config status: COMPLETE", curses.color_pair(0) | curses.A_BOLD)
     else:
-        stdscr.addstr(23, x0, "Config status: incomplete", curses.A_DIM)
+        stdscr.addstr(24, x0, "Config status: incomplete", curses.A_DIM)
 
     if message:
         stdscr.addstr(h - 2, 2, message[: max(0, w - 4)], curses.A_BOLD)
@@ -557,32 +563,38 @@ def _tui_select_disk(stdscr, disks: list[dict], current_path: str | None) -> str
 
 
 def _tui_partition_menu(stdscr, part: dict, cfg: GentooInstallConfig) -> None:
-    """Per-partition menu: assign roles (root/boot/swap).
+    """Per-partition menu: assign roles and optional format flags.
 
-    This does not modify partition table or format anything; it only updates
-    which partition will be used for which mountpoint.
+    This does not modify partition table immediately; it only updates config
+    about which partition will be used for which mountpoint and which should
+    be formatted during installation.
     """
 
     options = [
         "Set as root (/)",
         "Set as /boot (EFI or boot)",
         "Set as swap",
+        "Mark for format as ext4",
+        "Mark for format as vfat (EFI)",
+        "Clear format flag",
         "Cancel",
     ]
     idx = 0
     path = part.get("path")
     size = part.get("size") or ""
     fstype = part.get("fstype") or "-"
+    fmt = cfg.format_partitions.get(path or "", "")
 
     curses.curs_set(0)
     while True:
         stdscr.clear()
         stdscr.addstr(0, 2, path or "(unknown)", curses.A_BOLD)
         stdscr.addstr(1, 2, f"Size: {size}  FS: {fstype}")
-        stdscr.addstr(2, 2, "Assign role for this partition (q/ESC = back)")
+        stdscr.addstr(2, 2, f"Current format flag: {fmt or 'none'}")
+        stdscr.addstr(3, 2, "Assign role / format for this partition (q/ESC = back)")
         for i, label in enumerate(options):
             attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
-            stdscr.addstr(4 + i, 2, label, attr)
+            stdscr.addstr(5 + i, 2, label, attr)
         stdscr.refresh()
 
         ch = stdscr.getch()
@@ -598,7 +610,19 @@ def _tui_partition_menu(stdscr, part: dict, cfg: GentooInstallConfig) -> None:
                 cfg.boot_partition = path
             elif choice.startswith("Set as swap"):
                 cfg.swap_partition = path
-            return
+            elif choice.startswith("Mark for format as ext4"):
+                if path:
+                    cfg.format_partitions[path] = "ext4"
+            elif choice.startswith("Mark for format as vfat"):
+                if path:
+                    cfg.format_partitions[path] = "vfat"
+            elif choice.startswith("Clear format flag"):
+                if path and path in cfg.format_partitions:
+                    del cfg.format_partitions[path]
+            # refresh fmt for next redraw
+            fmt = cfg.format_partitions.get(path or "", "")
+            if choice.startswith("Cancel"):
+                return
         elif ch in (ord("q"), ord("Q"), 27):  # q or ESC
             return
 
@@ -625,7 +649,9 @@ def _tui_pick_manual_partitions(stdscr, disk: dict, cfg: GentooInstallConfig) ->
             mark_root = "(root)" if cfg.root_partition == p.get("path") else ""
             mark_boot = "(boot)" if cfg.boot_partition == p.get("path") else ""
             mark_swap = "(swap)" if cfg.swap_partition == p.get("path") else ""
-            mark = " ".join(m for m in [mark_root, mark_boot, mark_swap] if m).strip()
+            fmt = cfg.format_partitions.get(p.get("path") or "", None)
+            fmt_tag = f"[fmt:{fmt}]" if fmt else ""
+            mark = " ".join(m for m in [mark_root, mark_boot, mark_swap, fmt_tag] if m).strip()
             line = (
                 f"{p.get('path'):>16}  {p.get('size'):>8}  "
                 f"{(p.get('fstype') or '-'):6} {mark}"
@@ -959,6 +985,24 @@ def _tui_edit_network(stdscr, cfg: GentooInstallConfig) -> None:
             return
 
 
+def _tui_edit_stage3(stdscr, cfg: GentooInstallConfig) -> None:
+    """Configure source for the Gentoo stage3 tarball.
+
+    User can enter a local path or an HTTP/HTTPS URL. If left empty, the
+    installer will fall back to the GENTOO_STAGE3_TARBALL environment
+    variable or skip automatic stage3 extraction.
+    """
+
+    current = cfg.stage3_source or os.environ.get("GENTOO_STAGE3_TARBALL", "")
+    value = _tui_prompt_input(
+        stdscr,
+        "Stage3 source",
+        "Path or URL to stage3 tarball (blank = use env or skip)",
+        current or None,
+    )
+    cfg.stage3_source = value or None
+
+
 def tui_main(stdscr, cfg: GentooInstallConfig, dry_run: bool) -> bool:
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -983,6 +1027,8 @@ def tui_main(stdscr, cfg: GentooInstallConfig, dry_run: bool) -> bool:
             step = TUI_STEPS[current_idx]
             if step == "Language":
                 _tui_edit_language(stdscr, cfg)
+            elif step == "Stage3 source":
+                _tui_edit_stage3(stdscr, cfg)
             elif step == "Disk configuration":
                 _tui_edit_disk(stdscr, cfg)
             elif step == "Swap":
@@ -1148,10 +1194,24 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
     print("\n[STEP] Preparing disks")
 
     if cfg.disk_mode == "manual":
-        # Manual mode: do not touch partition table, just mount.
+        # Manual mode: optionally format marked partitions, then mount.
         if not cfg.root_partition:
             print("[ERROR] Manual disk mode selected but no root_partition set.")
             sys.exit(1)
+
+        if cfg.format_partitions:
+            print("Partitions marked to be formatted (manual mode):")
+            for path, fs in cfg.format_partitions.items():
+                print(f"  {path} -> {fs}")
+            if not confirm("Proceed with formatting the above partitions? THIS WILL DESTROY DATA."):
+                print("User declined formatting; continuing without mkfs.")
+            else:
+                for path, fs in cfg.format_partitions.items():
+                    if fs == "ext4":
+                        run_cmd(["mkfs.ext4", path], dry_run=dry_run)
+                    elif fs == "vfat":
+                        run_cmd(["mkfs.vfat", "-F32", path], dry_run=dry_run)
+
         print("Using existing partitions (manual mode); partition table will NOT be modified.")
         cmds: list[list[str]] = [
             ["mkdir", "-p", GENTOO_ROOT],
@@ -1253,14 +1313,23 @@ def install_stage3(cfg: GentooInstallConfig, dry_run: bool) -> None:
     # Ensure target directory exists
     os.makedirs(GENTOO_ROOT, exist_ok=True)
 
-    tarball = os.environ.get("GENTOO_STAGE3_TARBALL")
-    if not tarball:
+    # Determine tarball source: config path/URL, env var as fallback.
+    source = cfg.stage3_source or os.environ.get("GENTOO_STAGE3_TARBALL")
+    if not source:
         print(
-            "[WARN] GENTOO_STAGE3_TARBALL is not set. "
-            "Place a stage3 tarball somewhere and set this environment variable "
-            "to its full path before running with --execute. Skipping extraction.",
+            "[WARN] No stage3 source configured. "
+            "Set it in the TUI (Stage3 source) or via GENTOO_STAGE3_TARBALL. Skipping extraction.",
         )
         return
+
+    tarball = source
+
+    # If it's a URL, download it to a temporary location first.
+    if source.startswith("http://") or source.startswith("https://"):
+        dest = os.path.join("/tmp", os.path.basename(source) or "gentoo-stage3.tar.xz")
+        print(f"[STEP] Downloading stage3 from {source} to {dest}")
+        run_cmd(["wget", "-O", dest, source], dry_run=dry_run)
+        tarball = dest
 
     if not os.path.exists(tarball):
         print(f"[ERROR] Stage3 tarball not found: {tarball}")
