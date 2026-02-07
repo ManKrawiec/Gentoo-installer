@@ -10,6 +10,7 @@ import argparse
 import curses
 import dataclasses
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -27,6 +28,10 @@ class DesktopProfile:
 
 @dataclasses.dataclass
 class GentooInstallConfig:
+    # Simple schema version and script name to allow future evolution and alternative flows.
+    schema_version: int = 1
+    script: str = "guided"
+
     language: str = "en_US"
     # Stage3
     stage3_source: str | None = None  # local path or URL; optional if env var is used
@@ -82,7 +87,99 @@ class GentooInstallConfig:
         )
 
 
+def config_to_dict(cfg: GentooInstallConfig) -> Dict[str, object]:
+    """Convert config dataclass to a JSON-serializable dict.
+
+    Sensitive fields (passwords) are stripped so this can be safely stored in
+    a config file, similar in spirit to archinstall's user_configuration.
+    """
+
+    data = dataclasses.asdict(cfg)
+    data.pop("root_password", None)
+    data.pop("user_password", None)
+    return data
+
+
+def config_from_dict(data: Dict[str, object]) -> GentooInstallConfig:
+    """Create GentooInstallConfig from a dict (e.g. loaded from JSON).
+
+    Unknown keys are ignored to allow forward-compatible configs.
+    """
+
+    allowed = {f.name for f in dataclasses.fields(GentooInstallConfig)}
+    filtered: Dict[str, object] = {k: v for k, v in data.items() if k in allowed}
+    return GentooInstallConfig(**filtered)
+
+
+def load_config_file(path: str) -> GentooInstallConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return config_from_dict(data)
+
+
+def save_config_file(cfg: GentooInstallConfig, path: str) -> None:
+    data = config_to_dict(cfg)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+def load_credentials_into_config(cfg: GentooInstallConfig, path: str) -> None:
+    """Load root/user passwords from a separate JSON file into cfg.
+
+    This keeps credentials out of the main config JSON, mirroring the idea of
+    archinstall's user_credentials.json, but in a minimal Gentoo-specific way.
+    """
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict):
+        if "root_password" in data:
+            cfg.root_password = data["root_password"]
+        if "user_password" in data:
+            cfg.user_password = data["user_password"]
+
+
+def save_credentials_from_config(cfg: GentooInstallConfig, path: str) -> None:
+    """Write current root/user passwords from cfg into a credentials JSON file."""
+
+    payload: Dict[str, object] = {}
+    if cfg.root_password is not None:
+        payload["root_password"] = cfg.root_password
+    if cfg.user_password is not None:
+        payload["user_password"] = cfg.user_password
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
 GENTOO_ROOT = "/mnt/gentoo"
+
+
+def setup_logging(log_path: str | None = None) -> None:
+    """Configure basic logging to stdout and optional log file.
+
+    Logging is used primarily by the command runner so that all actions can be
+    replayed from a log file, similar in spirit to archinstall's
+    /var/log/archinstall/install.log, but tailored for this Gentoo installer.
+    """
+
+    if log_path is None:
+        log_path = "/var/log/gentoo-install/install.log"
+
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        # Fall back to stdout-only logging if we cannot write the log file.
+        print(f"[WARN] Could not create log file {log_path}: {exc!r}")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+    )
 
 
 DESKTOP_PROFILES: Dict[str, DesktopProfile] = {
@@ -174,10 +271,10 @@ def part_name(disk: str, number: int) -> str:
 
 
 def run_cmd(cmd: List[str], dry_run: bool) -> None:
-    """Run a shell command or just print it when in dry-run mode."""
+    """Run a shell command or just log it when in dry-run mode."""
 
     printable = " ".join(cmd)
-    print(f"[CMD]{' (dry-run)' if dry_run else ''}: {printable}")
+    logging.info("[CMD]%s: %s", " (dry-run)" if dry_run else "", printable)
     if dry_run:
         return
 
@@ -366,6 +463,7 @@ TUI_STEPS = [
     "Bootloader",
     "Kernel",
     "Network",
+    "Save config",
     "Install",
     "Abort",
 ]
@@ -1107,9 +1205,24 @@ def tui_main(stdscr, cfg: GentooInstallConfig, dry_run: bool) -> bool:
                 _tui_edit_kernel(stdscr, cfg)
             elif step == "Network":
                 _tui_edit_network(stdscr, cfg)
+            elif step == "Save config":
+                path = _tui_prompt_input(
+                    stdscr,
+                    "Save configuration",
+                    "Path to JSON file",
+                    "/root/gentoo_install_config.json",
+                )
+                if path:
+                    try:
+                        save_config_file(cfg, path)
+                        message = f"Configuration saved to {path}"
+                    except Exception as exc:  # noqa: BLE001
+                        message = f"Failed to save configuration: {exc!r}"
+                else:
+                    message = "Save cancelled."
             elif step == "Install":
                 if not cfg.is_complete():
-                    message = "Config incomplete – fill all fields before installing."
+                    message = "Config incomplete  fill all fields before installing."
                     continue
                 if _tui_confirm(stdscr, "Start installation now? (steps will run in this terminal)"):
                     return True
@@ -1414,22 +1527,35 @@ def install_stage3(cfg: GentooInstallConfig, dry_run: bool) -> None:
     generate_fstab(cfg, dry_run=dry_run, root=GENTOO_ROOT)
 
 
-def configure_base_system(cfg: GentooInstallConfig, dry_run: bool) -> None:
-    print("\\n[STEP] Configuring base system")
-    print("Setting up chroot mounts and basic system configuration.")
+def setup_chroot(cfg: GentooInstallConfig, dry_run: bool, root: str = GENTOO_ROOT) -> None:
+    """Set up the chroot environment for subsequent configuration steps.
 
+    This binds /proc, /sys, /dev and /run into the target root and copies
+    /etc/resolv.conf so that networking works inside the chroot. It is a thin
+    wrapper around setup_chroot_mounts plus basic network configuration.
+    """
+
+    print("\n[STEP] Setting up chroot environment")
     # Bind-mount /dev, /proc, /sys, /run into the stage3 root so that
     # subsequent chrooted commands behave like a normal system.
-    setup_chroot_mounts(dry_run=dry_run, root=GENTOO_ROOT)
+    setup_chroot_mounts(dry_run=dry_run, root=root)
 
     # --- resolv.conf ---
     host_resolv = "/etc/resolv.conf"
-    target_resolv = os.path.join(GENTOO_ROOT, "etc", "resolv.conf")
+    target_resolv = os.path.join(root, "etc", "resolv.conf")
     if os.path.exists(host_resolv):
         print(f"[STEP] Copying {host_resolv} -> {target_resolv}")
         if not dry_run:
             os.makedirs(os.path.dirname(target_resolv), exist_ok=True)
             shutil.copy2(host_resolv, target_resolv)
+
+
+def configure_base_system(cfg: GentooInstallConfig, dry_run: bool) -> None:
+    print("\n[STEP] Configuring base system")
+    print("Setting up chroot mounts and basic system configuration.")
+
+    # Prepare chroot so that subsequent steps can run commands inside it.
+    setup_chroot(cfg, dry_run=dry_run, root=GENTOO_ROOT)
 
     # --- hostname & hosts ---
     if cfg.hostname:
@@ -1607,7 +1733,7 @@ def _set_password(username: str, password: str, dry_run: bool) -> None:
 
     cmd = ["chroot", GENTOO_ROOT, "chpasswd"]
     printable = "chpasswd (stdin redacted)"
-    print(f"[CMD]{' (dry-run)' if dry_run else ''}: {printable}")
+    logging.info("[CMD]%s: %s", " (dry-run)" if dry_run else "", printable)
     if dry_run:
         return
 
@@ -1615,8 +1741,18 @@ def _set_password(username: str, password: str, dry_run: bool) -> None:
     subprocess.run(cmd, input=input_data, text=True, check=True)
 
 
+def mount_target(cfg: GentooInstallConfig, dry_run: bool) -> None:
+    """Compatibility wrapper that prepares disks and mounts the target.
+
+    This mirrors the intent of a mount_target() step: format any required
+    partitions and mount them under GENTOO_ROOT.
+    """
+
+    prepare_disks(cfg, dry_run=dry_run)
+
+
 def finalize_install(cfg: GentooInstallConfig, dry_run: bool) -> None:
-    print("\\n[STEP] Finalizing installation")
+    print("\n[STEP] Finalizing installation")
 
     # --- root password ---
     if cfg.root_password:
@@ -1674,7 +1810,7 @@ def finalize_install(cfg: GentooInstallConfig, dry_run: bool) -> None:
 
 def run_install(cfg: GentooInstallConfig, dry_run: bool) -> None:
     print("\n=== Starting installation pipeline ===")
-    prepare_disks(cfg, dry_run=dry_run)
+    mount_target(cfg, dry_run=dry_run)
     install_stage3(cfg, dry_run=dry_run)
     configure_base_system(cfg, dry_run=dry_run)
     install_bootloader(cfg, dry_run=dry_run)
@@ -1692,6 +1828,29 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         action="store_true",
         help="Actually run commands instead of dry-run.",
     )
+    parser.add_argument(
+        "--config",
+        help="Load installation configuration from JSON file (without passwords).",
+    )
+    parser.add_argument(
+        "--save-config",
+        help="Save final installation configuration (without passwords) to JSON file.",
+    )
+    parser.add_argument(
+        "--creds",
+        help="Load credentials (root/user passwords) from a separate JSON file.",
+    )
+    parser.add_argument(
+        "--save-creds",
+        help="Save credentials (root/user passwords) to a separate JSON file.",
+    )
+    parser.add_argument(
+        "--log-file",
+        help=(
+            "Path to installation log file (default: /var/log/gentoo-install/install.log). "
+            "If not writable, falls back to stdout-only logging."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1699,13 +1858,34 @@ def main(argv: List[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     args = parse_args(argv)
+
+    # Set up logging early so that commands and steps are recorded.
+    setup_logging(args.log_file)
+
     dry_run = not args.execute
 
     if dry_run:
         print("[INFO] Running in dry-run mode. Use --execute to perform real actions (dangerous!).")
 
-    # Start with empty config and run the curses TUI, similar in spirit to archinstall.
-    cfg = GentooInstallConfig()
+    # Load initial configuration from JSON if requested; otherwise start fresh.
+    if args.config:
+        try:
+            cfg = load_config_file(args.config)
+            print(f"[INFO] Loaded configuration from {args.config}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to load configuration from {args.config}: {exc!r}")
+            cfg = GentooInstallConfig()
+    else:
+        cfg = GentooInstallConfig()
+
+    # Optionally load credentials (passwords) from a separate JSON file.
+    if args.creds:
+        try:
+            load_credentials_into_config(cfg, args.creds)
+            print(f"[INFO] Loaded credentials from {args.creds}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to load credentials from {args.creds}: {exc!r}")
+
     try:
         should_install = run_tui(cfg, dry_run=dry_run)
     except Exception as exc:  # fallback if TUI fails for some reason
@@ -1716,6 +1896,21 @@ def main(argv: List[str] | None = None) -> int:
     if not should_install:
         print("Installation aborted from TUI.")
         return 1
+
+    # If requested, persist configuration and/or credentials before installation.
+    if args.save_config:
+        try:
+            save_config_file(cfg, args.save_config)
+            print(f"[INFO] Saved configuration to {args.save_config}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to save configuration to {args.save_config}: {exc!r}")
+
+    if args.save_creds:
+        try:
+            save_credentials_from_config(cfg, args.save_creds)
+            print(f"[INFO] Saved credentials to {args.save_creds}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to save credentials to {args.save_creds}: {exc!r}")
 
     run_install(cfg, dry_run=dry_run)
     return 0
