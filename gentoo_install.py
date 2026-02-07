@@ -542,8 +542,14 @@ def _tui_prompt_input(stdscr, title: str, prompt: str, default: str | None = Non
     stdscr.addstr(2, 2, prompt_full)
     stdscr.refresh()
 
+    # Allow long inputs even if the prompt itself almost fills the line. We
+    # cap the visible width to the terminal width but let curses accept a
+    # much longer string so that paths like /root/stage3-....tar.xz fit.
+    max_visible = max(1, w - len(prompt_full) - 4)
+    max_len = max(256, max_visible)
+
     curses.echo()
-    s = stdscr.getstr(2, 2 + len(prompt_full), max(0, w - len(prompt_full) - 4))
+    s = stdscr.getstr(2, 2 + len(prompt_full), max_len)
     curses.noecho()
     curses.curs_set(0)
 
