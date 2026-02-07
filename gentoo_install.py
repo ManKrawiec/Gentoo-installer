@@ -300,6 +300,17 @@ def run_in_chroot(cmd: List[str], dry_run: bool, root: str = GENTOO_ROOT) -> Non
     run_cmd(chroot_cmd, dry_run=dry_run)
 
 
+def run_in_chroot_capture(cmd: List[str], root: str = GENTOO_ROOT) -> subprocess.CompletedProcess:
+    """Run a command inside the Gentoo chroot and capture stdout/stderr.
+
+    This is useful for helpers like cpuid2cpuflags where we need the textual
+    output. It never prints; callers are responsible for logging.
+    """
+
+    chroot_cmd = ["chroot", root] + cmd
+    return subprocess.run(chroot_cmd, check=True, capture_output=True, text=True)
+
+
 def setup_chroot_mounts(dry_run: bool, root: str = GENTOO_ROOT) -> None:
     """Bind-mount host pseudo filesystems into the chroot.
 
@@ -1622,6 +1633,7 @@ def configure_base_system(cfg: GentooInstallConfig, dry_run: bool) -> None:
     if not dry_run:
         os.makedirs(os.path.dirname(make_conf_path), exist_ok=True)
         with open(make_conf_path, "a", encoding="utf-8") as f:
+            # Basic MAKEOPTS and emerge defaults
             f.write(f"MAKEOPTS=\"-j{jobs}\"\\n")
 
             emerge_opts: list[str] = [f"--jobs={jobs}", f"--load-average={jobs}"]
@@ -1629,11 +1641,78 @@ def configure_base_system(cfg: GentooInstallConfig, dry_run: bool) -> None:
                 emerge_opts.append("--keep-going")
             f.write(f"EMERGE_DEFAULT_OPTS=\"{' '.join(emerge_opts)}\"\\n")
 
+            # FEATURES
             features: list[str] = []
             if cfg.features_parallel_fetch:
                 features.append("parallel-fetch")
             if features:
                 f.write(f"FEATURES=\"{' '.join(features)}\"\\n")
+
+            # Licenses: mirror the guide's default of allowing free and
+            # binary-redistributable licenses.
+            accept_license = os.environ.get("GENTOO_ACCEPT_LICENSE", "-* @FREE @BINARY-REDISTRIBUTABLE")
+            f.write(f"ACCEPT_LICENSE=\"{accept_license}\"\\n")
+
+    # --- select best Gentoo mirrors using mirrorselect, if available ---
+    print("[STEP] Selecting Gentoo mirrors (if mirrorselect is installed)")
+    try:
+        result = run_cmd_capture(["mirrorselect", "-D", "-s4", "-o"])
+        mirrors_snippet = result.stdout.strip()
+        if mirrors_snippet:
+            print("[INFO] mirrorselect output:")
+            for line in mirrors_snippet.splitlines():
+                print("   ", line)
+            if not dry_run:
+                with open(make_conf_path, "a", encoding="utf-8") as f:
+                    f.write("\n" + mirrors_snippet + "\n")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] mirrorselect not available or failed: {exc!r}")
+
+    # --- ensure main Gentoo repository configuration exists ---
+    repos_src = os.path.join(GENTOO_ROOT, "usr", "share", "portage", "config", "repos.conf")
+    repos_dst_dir = os.path.join(GENTOO_ROOT, "etc", "portage", "repos.conf")
+    repos_dst = os.path.join(repos_dst_dir, "gentoo.conf")
+    if os.path.exists(repos_src):
+        print(f"[STEP] Copying Portage repos.conf from {repos_src} to {repos_dst}")
+        if not dry_run:
+            os.makedirs(repos_dst_dir, exist_ok=True)
+            shutil.copy2(repos_src, repos_dst)
+    else:
+        print(f"[WARN] Portage repos.conf template not found at {repos_src}")
+
+    # --- update the Portage tree ---
+    print("[STEP] Updating Portage tree (emerge --sync)")
+    try:
+        run_in_chroot(["emerge", "--sync"], dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Failed to sync Portage tree: {exc!r}")
+
+    # --- CPU flags (CPU_FLAGS_X86) via cpuid2cpuflags, if available ---
+    print("[STEP] Detecting CPU flags with cpuid2cpuflags (if available)")
+    try:
+        run_in_chroot(["emerge", "--noreplace", "app-portage/cpuid2cpuflags"], dry_run=dry_run)
+        if not dry_run:
+            res = run_in_chroot_capture(["cpuid2cpuflags"], root=GENTOO_ROOT)
+            line = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
+            if line and "CPU_FLAGS_X86" in line:
+                print(f"[INFO] cpuid2cpuflags output: {line}")
+                with open(make_conf_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            else:
+                print("[WARN] cpuid2cpuflags did not produce expected CPU_FLAGS_X86 line")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Failed to configure CPU_FLAGS_X86 via cpuid2cpuflags: {exc!r}")
+
+    # --- ensure /etc/mtab is a symlink to /proc/self/mounts ---
+    mtab_path = os.path.join(GENTOO_ROOT, "etc", "mtab")
+    print(f"[STEP] Ensuring {mtab_path} is a symlink to /proc/self/mounts")
+    if not dry_run:
+        try:
+            if os.path.islink(mtab_path) or os.path.exists(mtab_path):
+                os.remove(mtab_path)
+            os.symlink("/proc/self/mounts", mtab_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to set /etc/mtab symlink: {exc!r}")
 
     # --- kernel installation according to cfg.kernel ---
     install_kernel(cfg, dry_run=dry_run)
@@ -1651,6 +1730,15 @@ def install_kernel(cfg: GentooInstallConfig, dry_run: bool) -> None:
 
     mode = cfg.kernel
     print(f"[STEP] Installing kernel (mode={mode})")
+
+    # Ensure common firmware is available, mirroring the guide's
+    # recommendation to install sys-kernel/linux-firmware before kernel
+    # configuration. Failures here are non-fatal but will be logged.
+    try:
+        print("[STEP] Installing linux-firmware (sys-kernel/linux-firmware)")
+        run_in_chroot(["emerge", "--quiet-build=n", "sys-kernel/linux-firmware"], dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Failed to install linux-firmware: {exc!r}")
 
     if mode == "dist-kernel":
         # Gentoo distributed binary kernel
