@@ -35,6 +35,8 @@ class GentooInstallConfig:
     language: str = "en_US"
     # Stage3
     stage3_source: str | None = None  # local path or URL; optional if env var is used
+    gentoo_mirror: str = "https://distfiles.gentoo.org"  # mirror for stage3 download
+    stage3_variant: str = "systemd"  # systemd, openrc, musl, hardened
     # Build options
     makeopts_jobs: int | None = None  # value for -j in MAKEOPTS
     features_parallel_fetch: bool = True
@@ -47,8 +49,13 @@ class GentooInstallConfig:
     swap_partition: str | None = None
     # Map partition path -> filesystem to be created (only used in manual mode)
     format_partitions: Dict[str, str] = dataclasses.field(default_factory=dict)
-    root_fs: str = "ext4"
+    root_fs: str = "ext4"  # ext4, btrfs, xfs
     use_uefi: bool | None = None
+    # LUKS encryption
+    use_luks: bool = False
+    luks_password: str | None = None
+    # Btrfs subvolumes (used when root_fs == "btrfs")
+    btrfs_subvolumes: bool = True  # create @, @home, @snapshots
     # System
     desktop_profile: str | None = None
     hostname: str | None = None
@@ -60,7 +67,15 @@ class GentooInstallConfig:
     # Boot/kernel/network
     bootloader: str = "systemd-boot"
     kernel: str = "dist-kernel"  # dist-kernel, genkernel, manual
-    network_mode: str = "copy_iso"  # copy_iso, manual, nm_default, nm_iwd
+    initramfs_generator: str = "auto"  # auto, dracut, genkernel
+    network_mode: str = "copy_iso"  # copy_iso, manual, nm_default, nm_iwd, static
+    # Static network configuration (used when network_mode == "static")
+    static_ip: str | None = None  # e.g. "192.168.1.100/24"
+    static_gateway: str | None = None  # e.g. "192.168.1.1"
+    static_dns: str | None = None  # e.g. "1.1.1.1"
+    # Hooks (paths to scripts to run)
+    pre_install_hook: str | None = None
+    post_install_hook: str | None = None
 
     def is_complete(self) -> bool:
         # For manual mode we require at least root_partition, for auto we require target_disk.
@@ -68,6 +83,12 @@ class GentooInstallConfig:
             disk_ok = bool(self.root_partition)
         else:
             disk_ok = bool(self.target_disk)
+
+        # LUKS requires password
+        luks_ok = not self.use_luks or bool(self.luks_password)
+
+        # Static network requires IP config
+        net_ok = self.network_mode != "static" or bool(self.static_ip and self.static_gateway)
 
         return all(
             [
@@ -83,6 +104,8 @@ class GentooInstallConfig:
                 self.bootloader,
                 self.kernel,
                 self.network_mode,
+                luks_ok,
+                net_ok,
             ]
         )
 
@@ -256,6 +279,34 @@ NETWORK_MODES: list[str] = [
     "manual",        # User will configure later
     "nm_default",    # NetworkManager (default backend)
     "nm_iwd",        # NetworkManager (iwd backend)
+    "static",        # Static IP with systemd-networkd
+]
+
+FILESYSTEMS: list[str] = [
+    "ext4",
+    "btrfs",
+    "xfs",
+]
+
+STAGE3_VARIANTS: list[str] = [
+    "systemd",
+    "openrc",
+    "musl",
+    "hardened",
+]
+
+INITRAMFS_GENERATORS: list[str] = [
+    "auto",       # Auto-detect based on kernel type
+    "dracut",     # Use dracut
+    "genkernel",  # Use genkernel
+]
+
+GENTOO_MIRRORS: list[str] = [
+    "https://distfiles.gentoo.org",
+    "https://mirror.leaseweb.com/gentoo",
+    "https://ftp.fau.de/gentoo",
+    "https://ftp.snt.utwente.nl/pub/os/linux/gentoo",
+    "https://mirrors.ircam.fr/pub/gentoo-distfiles",
 ]
 
 
@@ -410,6 +461,471 @@ def generate_fstab(cfg: GentooInstallConfig, dry_run: bool, root: str = GENTOO_R
     print("[OK] fstab written.")
 
 
+# ---------- LUKS encryption ----------
+
+
+def get_luks_mapper_name(partition: str) -> str:
+    """Generate a mapper name for a LUKS partition."""
+    base = os.path.basename(partition)
+    return f"luks-{base}"
+
+
+def setup_luks(
+    partition: str,
+    password: str,
+    dry_run: bool,
+) -> str:
+    """Set up LUKS encryption on a partition.
+
+    Returns the path to the opened mapper device (e.g. /dev/mapper/luks-sda2).
+    """
+    mapper_name = get_luks_mapper_name(partition)
+    mapper_path = f"/dev/mapper/{mapper_name}"
+
+    print(f"[STEP] Setting up LUKS encryption on {partition}")
+
+    # Format the partition with LUKS
+    if dry_run:
+        logging.info("[CMD] (dry-run): cryptsetup luksFormat %s (password redacted)", partition)
+    else:
+        proc = subprocess.Popen(
+            ["cryptsetup", "luksFormat", "--type", "luks2", partition],
+            stdin=subprocess.PIPE,
+            text=True,
+        )
+        proc.communicate(input=password + "\n")
+        if proc.returncode != 0:
+            raise RuntimeError(f"cryptsetup luksFormat failed on {partition}")
+
+    # Open the LUKS container
+    if dry_run:
+        logging.info("[CMD] (dry-run): cryptsetup open %s %s (password redacted)", partition, mapper_name)
+    else:
+        proc = subprocess.Popen(
+            ["cryptsetup", "open", partition, mapper_name],
+            stdin=subprocess.PIPE,
+            text=True,
+        )
+        proc.communicate(input=password + "\n")
+        if proc.returncode != 0:
+            raise RuntimeError(f"cryptsetup open failed on {partition}")
+
+    print(f"[OK] LUKS container opened at {mapper_path}")
+    return mapper_path
+
+
+def generate_crypttab(
+    cfg: GentooInstallConfig,
+    luks_partition: str,
+    dry_run: bool,
+    root: str = GENTOO_ROOT,
+) -> None:
+    """Generate /etc/crypttab for LUKS partitions."""
+    if not cfg.use_luks:
+        return
+
+    crypttab_path = os.path.join(root, "etc", "crypttab")
+    mapper_name = get_luks_mapper_name(luks_partition)
+
+    print(f"[STEP] Generating crypttab at {crypttab_path}")
+
+    # Get UUID of the LUKS partition
+    try:
+        result = run_cmd_capture(["blkid", "-s", "UUID", "-o", "value", luks_partition])
+        luks_uuid = result.stdout.strip()
+    except Exception:
+        luks_uuid = luks_partition  # Fallback to device path
+
+    # Format: name UUID=<uuid> none luks
+    line = f"{mapper_name} UUID={luks_uuid} none luks\n"
+
+    print(f"[INFO] crypttab entry: {line.strip()}")
+
+    if dry_run:
+        print("[INFO] Dry-run: not writing crypttab.")
+        return
+
+    os.makedirs(os.path.dirname(crypttab_path), exist_ok=True)
+    with open(crypttab_path, "w", encoding="utf-8") as f:
+        f.write(line)
+    print("[OK] crypttab written.")
+
+
+# ---------- Btrfs with subvolumes ----------
+
+
+def format_btrfs_with_subvolumes(
+    device: str,
+    dry_run: bool,
+    root: str = GENTOO_ROOT,
+) -> None:
+    """Format a device with btrfs and create standard subvolumes.
+
+    Creates subvolumes: @ (root), @home, @snapshots
+    """
+    print(f"[STEP] Formatting {device} with btrfs and creating subvolumes")
+
+    # Format the device
+    run_cmd(["mkfs.btrfs", "-f", device], dry_run=dry_run)
+
+    if dry_run:
+        print("[INFO] Dry-run: skipping subvolume creation.")
+        return
+
+    # Mount temporarily to create subvolumes
+    tmp_mount = "/tmp/btrfs-setup"
+    os.makedirs(tmp_mount, exist_ok=True)
+
+    try:
+        subprocess.run(["mount", device, tmp_mount], check=True)
+
+        # Create subvolumes
+        for subvol in ["@", "@home", "@snapshots"]:
+            subvol_path = os.path.join(tmp_mount, subvol)
+            subprocess.run(["btrfs", "subvolume", "create", subvol_path], check=True)
+            print(f"[OK] Created subvolume: {subvol}")
+
+        subprocess.run(["umount", tmp_mount], check=True)
+    finally:
+        # Cleanup
+        if os.path.ismount(tmp_mount):
+            subprocess.run(["umount", tmp_mount], check=False)
+        os.rmdir(tmp_mount)
+
+
+def mount_btrfs_subvolumes(
+    device: str,
+    dry_run: bool,
+    root: str = GENTOO_ROOT,
+) -> None:
+    """Mount btrfs subvolumes in the correct layout."""
+    print(f"[STEP] Mounting btrfs subvolumes from {device}")
+
+    mount_opts = "compress=zstd,noatime"
+
+    # Mount @ as root
+    run_cmd(
+        ["mount", "-o", f"{mount_opts},subvol=@", device, root],
+        dry_run=dry_run,
+    )
+
+    # Create and mount @home
+    home_path = os.path.join(root, "home")
+    if not dry_run:
+        os.makedirs(home_path, exist_ok=True)
+    run_cmd(
+        ["mount", "-o", f"{mount_opts},subvol=@home", device, home_path],
+        dry_run=dry_run,
+    )
+
+    # Create and mount @snapshots
+    snapshots_path = os.path.join(root, ".snapshots")
+    if not dry_run:
+        os.makedirs(snapshots_path, exist_ok=True)
+    run_cmd(
+        ["mount", "-o", f"{mount_opts},subvol=@snapshots", device, snapshots_path],
+        dry_run=dry_run,
+    )
+
+    print("[OK] Btrfs subvolumes mounted.")
+
+
+def generate_btrfs_fstab(
+    device: str,
+    cfg: GentooInstallConfig,
+    dry_run: bool,
+    root: str = GENTOO_ROOT,
+) -> None:
+    """Generate fstab entries for btrfs subvolumes."""
+    fstab_path = os.path.join(root, "etc", "fstab")
+    os.makedirs(os.path.dirname(fstab_path), exist_ok=True)
+
+    print(f"[STEP] Generating btrfs fstab at {fstab_path}")
+
+    # Get UUID
+    try:
+        result = run_cmd_capture(["blkid", "-s", "UUID", "-o", "value", device])
+        uuid = result.stdout.strip()
+    except Exception:
+        uuid = device
+
+    mount_opts = "compress=zstd,noatime"
+    lines = [
+        f"UUID={uuid} / btrfs {mount_opts},subvol=@ 0 0",
+        f"UUID={uuid} /home btrfs {mount_opts},subvol=@home 0 0",
+        f"UUID={uuid} /.snapshots btrfs {mount_opts},subvol=@snapshots 0 0",
+    ]
+
+    # Add boot partition if exists
+    if cfg.boot_partition:
+        try:
+            result = run_cmd_capture(["blkid", "-s", "UUID", "-o", "value", cfg.boot_partition])
+            boot_uuid = result.stdout.strip()
+            lines.append(f"UUID={boot_uuid} /boot vfat defaults 0 2")
+        except Exception:
+            pass
+
+    # Add swap if exists
+    if cfg.swap_partition:
+        try:
+            result = run_cmd_capture(["blkid", "-s", "UUID", "-o", "value", cfg.swap_partition])
+            swap_uuid = result.stdout.strip()
+            lines.append(f"UUID={swap_uuid} none swap sw 0 0")
+        except Exception:
+            pass
+
+    content = "\n".join(lines) + "\n"
+    print("[INFO] Btrfs fstab entries:")
+    for line in lines:
+        print(f"  {line}")
+
+    if dry_run:
+        print("[INFO] Dry-run: not writing fstab.")
+        return
+
+    with open(fstab_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print("[OK] Btrfs fstab written.")
+
+
+# ---------- Automatic stage3 download ----------
+
+
+def get_latest_stage3_url(mirror: str, arch: str = "amd64", variant: str = "systemd") -> str | None:
+    """Fetch the latest stage3 tarball URL from a Gentoo mirror.
+
+    Parses the latest-stage3-<arch>-<variant>.txt file to get the filename.
+    """
+    import urllib.request
+
+    # Construct the URL to the latest file
+    # e.g. https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-systemd.txt
+    latest_url = f"{mirror}/releases/{arch}/autobuilds/latest-stage3-{arch}-{variant}.txt"
+
+    print(f"[STEP] Fetching latest stage3 info from {latest_url}")
+
+    try:
+        with urllib.request.urlopen(latest_url, timeout=30) as resp:
+            content = resp.read().decode("utf-8")
+    except Exception as exc:
+        print(f"[WARN] Failed to fetch latest stage3 info: {exc!r}")
+        return None
+
+    # Parse the file - format is: <path> <size>
+    # Lines starting with # are comments
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if parts:
+            filename = parts[0]
+            # Return full URL
+            return f"{mirror}/releases/{arch}/autobuilds/{filename}"
+
+    return None
+
+
+def download_stage3(
+    cfg: GentooInstallConfig,
+    dest_dir: str = "/tmp",
+    dry_run: bool = False,
+) -> str | None:
+    """Download the latest stage3 tarball from the configured mirror.
+
+    Returns the local path to the downloaded tarball, or None on failure.
+    """
+    mirror = cfg.gentoo_mirror
+    variant = cfg.stage3_variant
+
+    url = get_latest_stage3_url(mirror, variant=variant)
+    if not url:
+        print("[ERROR] Could not determine latest stage3 URL.")
+        return None
+
+    filename = os.path.basename(url)
+    dest_path = os.path.join(dest_dir, filename)
+
+    print(f"[STEP] Downloading stage3 from {url}")
+    print(f"[INFO] Destination: {dest_path}")
+
+    if dry_run:
+        print("[INFO] Dry-run: not downloading.")
+        return dest_path
+
+    run_cmd(["wget", "-c", "-O", dest_path, url], dry_run=False)
+
+    # Optionally download and verify GPG signature
+    asc_url = url + ".asc"
+    asc_path = dest_path + ".asc"
+    try:
+        run_cmd(["wget", "-c", "-O", asc_path, asc_url], dry_run=False)
+        print("[INFO] GPG signature downloaded. Manual verification recommended.")
+    except Exception:
+        print("[WARN] Could not download GPG signature.")
+
+    return dest_path
+
+
+# ---------- Static network configuration ----------
+
+
+def configure_static_network(
+    cfg: GentooInstallConfig,
+    dry_run: bool,
+    root: str = GENTOO_ROOT,
+) -> None:
+    """Configure static IP using systemd-networkd."""
+    if cfg.network_mode != "static":
+        return
+
+    if not cfg.static_ip or not cfg.static_gateway:
+        print("[WARN] Static network mode selected but IP/gateway not configured.")
+        return
+
+    print("[STEP] Configuring static network with systemd-networkd")
+
+    networkd_dir = os.path.join(root, "etc", "systemd", "network")
+    network_file = os.path.join(networkd_dir, "20-wired.network")
+
+    content = f"""[Match]
+Name=en*
+
+[Network]
+Address={cfg.static_ip}
+Gateway={cfg.static_gateway}
+"""
+
+    if cfg.static_dns:
+        content += f"DNS={cfg.static_dns}\n"
+
+    print(f"[INFO] Network configuration:")
+    for line in content.strip().splitlines():
+        print(f"  {line}")
+
+    if dry_run:
+        print("[INFO] Dry-run: not writing network config.")
+        return
+
+    os.makedirs(networkd_dir, exist_ok=True)
+    with open(network_file, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    print(f"[OK] Network config written to {network_file}")
+
+
+# ---------- Dracut initramfs ----------
+
+
+def configure_dracut(
+    cfg: GentooInstallConfig,
+    dry_run: bool,
+    root: str = GENTOO_ROOT,
+) -> None:
+    """Configure dracut for initramfs generation.
+
+    Sets up dracut.conf.d with appropriate modules for LUKS, btrfs, etc.
+    """
+    dracut_dir = os.path.join(root, "etc", "dracut.conf.d")
+
+    print("[STEP] Configuring dracut")
+
+    # Base configuration
+    base_conf = """# Generated by gentoo_install.py
+hostonly="yes"
+hostonly_cmdline="yes"
+"""
+
+    # LUKS configuration
+    if cfg.use_luks:
+        base_conf += """
+# LUKS support
+add_dracutmodules+=" crypt dm "
+install_items+=" /etc/crypttab "
+"""
+
+    # Btrfs configuration
+    if cfg.root_fs == "btrfs":
+        base_conf += """
+# Btrfs support
+add_dracutmodules+=" btrfs "
+"""
+
+    print("[INFO] Dracut configuration:")
+    for line in base_conf.strip().splitlines():
+        print(f"  {line}")
+
+    if dry_run:
+        print("[INFO] Dry-run: not writing dracut config.")
+        return
+
+    os.makedirs(dracut_dir, exist_ok=True)
+    conf_file = os.path.join(dracut_dir, "gentoo-install.conf")
+    with open(conf_file, "w", encoding="utf-8") as f:
+        f.write(base_conf)
+
+    print(f"[OK] Dracut config written to {conf_file}")
+
+
+def generate_initramfs_dracut(
+    cfg: GentooInstallConfig,
+    dry_run: bool,
+    root: str = GENTOO_ROOT,
+) -> None:
+    """Generate initramfs using dracut inside the chroot."""
+    print("[STEP] Generating initramfs with dracut")
+
+    # Install dracut if not present
+    run_in_chroot(["emerge", "--noreplace", "sys-kernel/dracut"], dry_run=dry_run)
+
+    # Configure dracut
+    configure_dracut(cfg, dry_run=dry_run, root=root)
+
+    # Regenerate initramfs for all installed kernels
+    run_in_chroot(["dracut", "--regenerate-all", "--force"], dry_run=dry_run)
+
+    print("[OK] Initramfs generated with dracut.")
+
+
+# ---------- Hooks ----------
+
+
+def run_hook(hook_path: str | None, phase: str, cfg: GentooInstallConfig, dry_run: bool) -> None:
+    """Run a user-defined hook script.
+
+    The hook receives environment variables with installation config.
+    """
+    if not hook_path:
+        return
+
+    if not os.path.exists(hook_path):
+        print(f"[WARN] Hook script not found: {hook_path}")
+        return
+
+    print(f"[STEP] Running {phase} hook: {hook_path}")
+
+    # Set up environment with config values
+    env = os.environ.copy()
+    env["GENTOO_INSTALL_PHASE"] = phase
+    env["GENTOO_INSTALL_ROOT"] = GENTOO_ROOT
+    env["GENTOO_INSTALL_HOSTNAME"] = cfg.hostname or ""
+    env["GENTOO_INSTALL_USERNAME"] = cfg.username or ""
+    env["GENTOO_INSTALL_DISK"] = cfg.target_disk or ""
+    env["GENTOO_INSTALL_ROOT_FS"] = cfg.root_fs
+    env["GENTOO_INSTALL_USE_LUKS"] = "1" if cfg.use_luks else "0"
+    env["GENTOO_INSTALL_USE_BTRFS"] = "1" if cfg.root_fs == "btrfs" else "0"
+
+    if dry_run:
+        logging.info("[CMD] (dry-run): %s", hook_path)
+        return
+
+    try:
+        subprocess.run([hook_path], env=env, check=True)
+        print(f"[OK] {phase} hook completed.")
+    except subprocess.CalledProcessError as exc:
+        print(f"[WARN] {phase} hook failed: {exc!r}")
+
+
 def list_disks() -> list[dict]:
     """Return a list of available disks using lsblk JSON output.
 
@@ -466,6 +982,8 @@ TUI_STEPS = [
     "Stage3 source",
     "Build options",
     "Disk configuration",
+    "Encryption (LUKS)",
+    "Filesystem",
     "Swap",
     "Hostname",
     "User",
@@ -474,6 +992,7 @@ TUI_STEPS = [
     "Bootloader",
     "Kernel",
     "Network",
+    "Hooks",
     "Save config",
     "Install",
     "Abort",
@@ -508,21 +1027,22 @@ def _tui_draw_main(stdscr, current_idx: int, cfg: GentooInstallConfig, message: 
     stdscr.addstr(13, x0, f"Boot part.: {cfg.boot_partition or '-'}")
     stdscr.addstr(14, x0, f"Swap part.: {cfg.swap_partition or '-'}")
     stdscr.addstr(15, x0, f"Root FS   : {cfg.root_fs or '-'}")
-    stdscr.addstr(16, x0, f"UEFI      : " + ("yes" if cfg.use_uefi else "no" if cfg.use_uefi is not None else "-"))
-    stdscr.addstr(17, x0, f"Hostname  : {cfg.hostname or '-'}")
-    stdscr.addstr(18, x0, f"User      : {cfg.username or '-'}")
-    stdscr.addstr(19, x0, f"Root pwd  : {'set' if cfg.root_password else 'NOT set'}")
-    stdscr.addstr(20, x0, f"User pwd  : {'set' if cfg.user_password else 'NOT set'}")
-    stdscr.addstr(21, x0, f"User sudo : {'yes' if cfg.user_is_sudoer else 'no'}")
+    stdscr.addstr(16, x0, f"LUKS      : {'yes' if cfg.use_luks else 'no'}")
+    stdscr.addstr(17, x0, f"UEFI      : " + ("yes" if cfg.use_uefi else "no" if cfg.use_uefi is not None else "-"))
+    stdscr.addstr(18, x0, f"Hostname  : {cfg.hostname or '-'}")
+    stdscr.addstr(19, x0, f"User      : {cfg.username or '-'}")
+    stdscr.addstr(20, x0, f"Root pwd  : {'set' if cfg.root_password else 'NOT set'}")
+    stdscr.addstr(21, x0, f"User pwd  : {'set' if cfg.user_password else 'NOT set'}")
     stdscr.addstr(22, x0, f"Desktop   : {cfg.desktop_profile or '-'}")
     stdscr.addstr(23, x0, f"Bootloader: {cfg.bootloader or '-'}")
     stdscr.addstr(24, x0, f"Kernel    : {cfg.kernel or '-'}")
     stdscr.addstr(25, x0, f"Network   : {cfg.network_mode or '-'}")
 
+    row = 27
     if cfg.is_complete():
-        stdscr.addstr(25, x0, "Config status: COMPLETE", curses.color_pair(0) | curses.A_BOLD)
+        stdscr.addstr(row, x0, "Config status: COMPLETE", curses.color_pair(0) | curses.A_BOLD)
     else:
-        stdscr.addstr(25, x0, "Config status: incomplete", curses.A_DIM)
+        stdscr.addstr(row, x0, "Config status: incomplete", curses.A_DIM)
 
     if message:
         stdscr.addstr(h - 2, 2, message[: max(0, w - 4)], curses.A_BOLD)
@@ -1082,6 +1602,7 @@ def _tui_edit_network(stdscr, cfg: GentooInstallConfig) -> None:
         "manual": "Manual configuration",
         "nm_default": "Use NetworkManager (default backend)",
         "nm_iwd": "Use NetworkManager (iwd backend)",
+        "static": "Static IP (systemd-networkd)",
     }
 
     while True:
@@ -1103,6 +1624,14 @@ def _tui_edit_network(stdscr, cfg: GentooInstallConfig) -> None:
             current_idx += 1
         elif ch in (curses.KEY_ENTER, 10, 13):
             cfg.network_mode = NETWORK_MODES[current_idx]
+            # If static mode selected, prompt for IP details
+            if cfg.network_mode == "static":
+                ip = _tui_prompt_input(stdscr, "Static IP", "IP address with CIDR (e.g. 192.168.1.100/24)", cfg.static_ip)
+                cfg.static_ip = ip
+                gw = _tui_prompt_input(stdscr, "Static IP", "Gateway (e.g. 192.168.1.1)", cfg.static_gateway)
+                cfg.static_gateway = gw
+                dns = _tui_prompt_input(stdscr, "Static IP", "DNS server (e.g. 1.1.1.1)", cfg.static_dns or "1.1.1.1")
+                cfg.static_dns = dns
             return
         elif ch in (ord("q"), ord("Q"), 27):  # q or ESC
             return
@@ -1176,6 +1705,134 @@ def _tui_edit_build_options(stdscr, cfg: GentooInstallConfig) -> None:
             cfg.emerge_keep_going = False
 
 
+def _tui_edit_encryption(stdscr, cfg: GentooInstallConfig) -> None:
+    """Configure LUKS encryption."""
+    curses.curs_set(0)
+    options = [
+        "Enable LUKS encryption",
+        "Disable LUKS encryption",
+        "Set LUKS password",
+        "Back",
+    ]
+    idx = 0
+
+    while True:
+        stdscr.clear()
+        stdscr.addstr(0, 2, "Encryption (LUKS)", curses.A_BOLD)
+        stdscr.addstr(1, 2, "Configure disk encryption.")
+        stdscr.addstr(3, 2, f"LUKS enabled   : {'yes' if cfg.use_luks else 'no'}")
+        stdscr.addstr(4, 2, f"LUKS password  : {'set' if cfg.luks_password else 'NOT set'}")
+
+        for i, label in enumerate(options):
+            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            stdscr.addstr(6 + i, 2, label, attr)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP and idx > 0:
+            idx -= 1
+        elif ch == curses.KEY_DOWN and idx < len(options) - 1:
+            idx += 1
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            choice = options[idx]
+            if choice.startswith("Enable"):
+                cfg.use_luks = True
+            elif choice.startswith("Disable"):
+                cfg.use_luks = False
+            elif choice.startswith("Set LUKS"):
+                pw = _tui_prompt_password(stdscr, "LUKS password", "Enter LUKS encryption password")
+                if pw:
+                    cfg.luks_password = pw
+            else:
+                return
+        elif ch in (ord("q"), ord("Q"), 27):
+            return
+
+
+def _tui_edit_filesystem(stdscr, cfg: GentooInstallConfig) -> None:
+    """Configure root filesystem type."""
+    curses.curs_set(0)
+    try:
+        current_idx = FILESYSTEMS.index(cfg.root_fs)
+    except ValueError:
+        current_idx = 0
+
+    while True:
+        stdscr.clear()
+        stdscr.addstr(0, 2, "Root filesystem", curses.A_BOLD)
+        stdscr.addstr(1, 2, "Choose filesystem for the root partition.")
+        for i, fs in enumerate(FILESYSTEMS):
+            label = fs
+            if fs == "btrfs":
+                label += " (with subvolumes)" if cfg.btrfs_subvolumes else ""
+            mark = "[x]" if fs == cfg.root_fs else "[ ]"
+            attr = curses.A_REVERSE if i == current_idx else curses.A_NORMAL
+            stdscr.addstr(3 + i, 2, f"{mark} {label}", attr)
+
+        stdscr.addstr(4 + len(FILESYSTEMS), 2, "Enter = select, b = toggle btrfs subvols, q = cancel")
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP and current_idx > 0:
+            current_idx -= 1
+        elif ch == curses.KEY_DOWN and current_idx < len(FILESYSTEMS) - 1:
+            current_idx += 1
+        elif ch in (ord("b"), ord("B")):
+            cfg.btrfs_subvolumes = not cfg.btrfs_subvolumes
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            cfg.root_fs = FILESYSTEMS[current_idx]
+            return
+        elif ch in (ord("q"), ord("Q"), 27):
+            return
+
+
+def _tui_edit_hooks(stdscr, cfg: GentooInstallConfig) -> None:
+    """Configure pre/post-install hooks."""
+    curses.curs_set(0)
+    options = [
+        "Set pre-install hook",
+        "Set post-install hook",
+        "Clear pre-install hook",
+        "Clear post-install hook",
+        "Back",
+    ]
+    idx = 0
+
+    while True:
+        stdscr.clear()
+        stdscr.addstr(0, 2, "Installation hooks", curses.A_BOLD)
+        stdscr.addstr(1, 2, "Configure scripts to run before/after installation.")
+        stdscr.addstr(3, 2, f"Pre-install  : {cfg.pre_install_hook or '(none)'}")
+        stdscr.addstr(4, 2, f"Post-install : {cfg.post_install_hook or '(none)'}")
+
+        for i, label in enumerate(options):
+            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            stdscr.addstr(6 + i, 2, label, attr)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP and idx > 0:
+            idx -= 1
+        elif ch == curses.KEY_DOWN and idx < len(options) - 1:
+            idx += 1
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            choice = options[idx]
+            if choice.startswith("Set pre"):
+                path = _tui_prompt_input(stdscr, "Pre-install hook", "Path to script", cfg.pre_install_hook)
+                cfg.pre_install_hook = path
+            elif choice.startswith("Set post"):
+                path = _tui_prompt_input(stdscr, "Post-install hook", "Path to script", cfg.post_install_hook)
+                cfg.post_install_hook = path
+            elif choice.startswith("Clear pre"):
+                cfg.pre_install_hook = None
+            elif choice.startswith("Clear post"):
+                cfg.post_install_hook = None
+            else:
+                return
+        elif ch in (ord("q"), ord("Q"), 27):
+            return
+
+
 def tui_main(stdscr, cfg: GentooInstallConfig, dry_run: bool) -> bool:
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -1206,6 +1863,10 @@ def tui_main(stdscr, cfg: GentooInstallConfig, dry_run: bool) -> bool:
                 _tui_edit_build_options(stdscr, cfg)
             elif step == "Disk configuration":
                 _tui_edit_disk(stdscr, cfg)
+            elif step == "Encryption (LUKS)":
+                _tui_edit_encryption(stdscr, cfg)
+            elif step == "Filesystem":
+                _tui_edit_filesystem(stdscr, cfg)
             elif step == "Swap":
                 _tui_edit_swap(stdscr, cfg)
             elif step == "Hostname":
@@ -1222,6 +1883,8 @@ def tui_main(stdscr, cfg: GentooInstallConfig, dry_run: bool) -> bool:
                 _tui_edit_kernel(stdscr, cfg)
             elif step == "Network":
                 _tui_edit_network(stdscr, cfg)
+            elif step == "Hooks":
+                _tui_edit_hooks(stdscr, cfg)
             elif step == "Save config":
                 path = _tui_prompt_input(
                     stdscr,
@@ -1374,8 +2037,10 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
     """Partition, format and mount the target disk or reuse existing partitions.
 
     Layout implemented for auto mode:
-    - UEFI: GPT, 512MiB EFI system partition (FAT32) + rest as ext4 root.
-    - BIOS: MBR (msdos), single ext4 root partition using the whole disk.
+    - UEFI: GPT, 512MiB EFI system partition (FAT32) + rest as root.
+    - BIOS: MBR (msdos), single root partition using the whole disk.
+
+    Supports LUKS encryption and btrfs with subvolumes.
 
     For manual mode:
     - Reuses existing partitions, only mounts the ones selected in config.
@@ -1383,11 +2048,23 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
 
     print("\n[STEP] Preparing disks")
 
+    # Track which partition holds the actual root data (may be a mapper device)
+    actual_root_device: str | None = None
+    luks_base_partition: str | None = None  # The raw partition before LUKS
+
     if cfg.disk_mode == "manual":
         # Manual mode: optionally format marked partitions, then mount.
         if not cfg.root_partition:
             print("[ERROR] Manual disk mode selected but no root_partition set.")
             sys.exit(1)
+
+        # Handle LUKS in manual mode
+        if cfg.use_luks and cfg.luks_password:
+            print("[STEP] Setting up LUKS on root partition (manual mode)")
+            luks_base_partition = cfg.root_partition
+            actual_root_device = setup_luks(cfg.root_partition, cfg.luks_password, dry_run)
+        else:
+            actual_root_device = cfg.root_partition
 
         if cfg.format_partitions:
             print("Partitions marked to be formatted (manual mode):")
@@ -1397,25 +2074,47 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
                 print("User declined formatting; continuing without mkfs.")
             else:
                 for path, fs in cfg.format_partitions.items():
+                    # Skip root if using LUKS - it will be formatted on the mapper
+                    if cfg.use_luks and path == cfg.root_partition:
+                        continue
                     if fs == "ext4":
                         run_cmd(["mkfs.ext4", path], dry_run=dry_run)
+                    elif fs == "btrfs":
+                        run_cmd(["mkfs.btrfs", "-f", path], dry_run=dry_run)
+                    elif fs == "xfs":
+                        run_cmd(["mkfs.xfs", "-f", path], dry_run=dry_run)
                     elif fs == "vfat":
                         run_cmd(["mkfs.vfat", "-F32", path], dry_run=dry_run)
 
         print("Using existing partitions (manual mode); partition table will NOT be modified.")
-        cmds: list[list[str]] = [
-            ["mkdir", "-p", GENTOO_ROOT],
-            ["mount", cfg.root_partition, GENTOO_ROOT],
-        ]
+
+        # Format and mount root (possibly on LUKS mapper)
+        run_cmd(["mkdir", "-p", GENTOO_ROOT], dry_run=dry_run)
+
+        if cfg.root_fs == "btrfs" and cfg.btrfs_subvolumes:
+            format_btrfs_with_subvolumes(actual_root_device, dry_run=dry_run)
+            mount_btrfs_subvolumes(actual_root_device, dry_run=dry_run)
+        else:
+            # Format if root_partition was marked for formatting
+            if cfg.root_partition in cfg.format_partitions:
+                fs = cfg.format_partitions[cfg.root_partition]
+                if fs == "ext4":
+                    run_cmd(["mkfs.ext4", actual_root_device], dry_run=dry_run)
+                elif fs == "btrfs":
+                    run_cmd(["mkfs.btrfs", "-f", actual_root_device], dry_run=dry_run)
+                elif fs == "xfs":
+                    run_cmd(["mkfs.xfs", "-f", actual_root_device], dry_run=dry_run)
+            run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
+
         if cfg.boot_partition:
-            cmds.extend(
-                [
-                    ["mkdir", "-p", os.path.join(GENTOO_ROOT, "boot")],
-                    ["mount", cfg.boot_partition, os.path.join(GENTOO_ROOT, "boot")],
-                ]
-            )
-        for cmd in cmds:
-            run_cmd(cmd, dry_run)
+            boot_path = os.path.join(GENTOO_ROOT, "boot")
+            run_cmd(["mkdir", "-p", boot_path], dry_run=dry_run)
+            run_cmd(["mount", cfg.boot_partition, boot_path], dry_run=dry_run)
+
+        # Generate crypttab if LUKS was used
+        if cfg.use_luks and luks_base_partition:
+            generate_crypttab(cfg, luks_base_partition, dry_run=dry_run)
+
         return
 
     # Auto mode: warn that entire disk will be wiped.
@@ -1423,70 +2122,98 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
         print("Skipping disk preparation.")
         return
 
-    if cfg.root_fs != "ext4":
-        print("[WARN] Only ext4 is implemented right now; using ext4 for root.")
+    boot_part = part_name(cfg.target_disk, 1)
+    root_part = part_name(cfg.target_disk, 2)
 
     if cfg.use_uefi:
-        print("Planning GPT + EFI system partition + ext4 root on", cfg.target_disk)
-        boot_part = part_name(cfg.target_disk, 1)
-        root_part = part_name(cfg.target_disk, 2)
+        print(f"Planning GPT + EFI + {cfg.root_fs} root on {cfg.target_disk}")
+        if cfg.use_luks:
+            print("[INFO] LUKS encryption will be applied to root partition.")
 
-        cmds = [
-            # Partition table and partitions
-            ["parted", cfg.target_disk, "--script", "mklabel", "gpt"],
-            [
-                "parted",
-                cfg.target_disk,
-                "--script",
-                "mkpart",
-                "ESP",
-                "fat32",
-                "1MiB",
-                "513MiB",
-            ],
-            ["parted", cfg.target_disk, "--script", "set", "1", "boot", "on"],
-            [
-                "parted",
-                cfg.target_disk,
-                "--script",
-                "mkpart",
-                "primary",
-                "ext4",
-                "513MiB",
-                "100%",
-            ],
-            # Filesystems
-            ["mkfs.vfat", "-F32", boot_part],
-            ["mkfs.ext4", root_part],
-            # Mount points
-            ["mkdir", "-p", GENTOO_ROOT],
-            ["mount", root_part, GENTOO_ROOT],
-            ["mkdir", "-p", os.path.join(GENTOO_ROOT, "boot")],
-            ["mount", boot_part, os.path.join(GENTOO_ROOT, "boot")],
-        ]
+        # Create partition table
+        run_cmd(["parted", cfg.target_disk, "--script", "mklabel", "gpt"], dry_run=dry_run)
+        run_cmd(
+            ["parted", cfg.target_disk, "--script", "mkpart", "ESP", "fat32", "1MiB", "513MiB"],
+            dry_run=dry_run,
+        )
+        run_cmd(["parted", cfg.target_disk, "--script", "set", "1", "boot", "on"], dry_run=dry_run)
+        run_cmd(
+            ["parted", cfg.target_disk, "--script", "mkpart", "primary", cfg.root_fs, "513MiB", "100%"],
+            dry_run=dry_run,
+        )
+
+        # Format boot partition
+        run_cmd(["mkfs.vfat", "-F32", boot_part], dry_run=dry_run)
+
+        # Handle LUKS encryption
+        if cfg.use_luks and cfg.luks_password:
+            luks_base_partition = root_part
+            actual_root_device = setup_luks(root_part, cfg.luks_password, dry_run)
+        else:
+            actual_root_device = root_part
+
+        # Format root filesystem
+        run_cmd(["mkdir", "-p", GENTOO_ROOT], dry_run=dry_run)
+
+        if cfg.root_fs == "btrfs" and cfg.btrfs_subvolumes:
+            format_btrfs_with_subvolumes(actual_root_device, dry_run=dry_run)
+            mount_btrfs_subvolumes(actual_root_device, dry_run=dry_run)
+        elif cfg.root_fs == "btrfs":
+            run_cmd(["mkfs.btrfs", "-f", actual_root_device], dry_run=dry_run)
+            run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
+        elif cfg.root_fs == "xfs":
+            run_cmd(["mkfs.xfs", "-f", actual_root_device], dry_run=dry_run)
+            run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
+        else:  # ext4 default
+            run_cmd(["mkfs.ext4", actual_root_device], dry_run=dry_run)
+            run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
+
+        # Mount boot
+        boot_path = os.path.join(GENTOO_ROOT, "boot")
+        run_cmd(["mkdir", "-p", boot_path], dry_run=dry_run)
+        run_cmd(["mount", boot_part, boot_path], dry_run=dry_run)
+
     else:
-        print("Planning BIOS/MBR layout with single ext4 root on", cfg.target_disk)
+        # BIOS/MBR mode
+        print(f"Planning BIOS/MBR layout with {cfg.root_fs} root on {cfg.target_disk}")
         root_part = part_name(cfg.target_disk, 1)
 
-        cmds = [
-            ["parted", cfg.target_disk, "--script", "mklabel", "msdos"],
-            [
-                "parted",
-                cfg.target_disk,
-                "--script",
-                "mkpart",
-                "primary",
-                "ext4",
-                "1MiB",
-                "100%",
-            ],
-            ["mkfs.ext4", root_part],
-            ["mkdir", "-p", GENTOO_ROOT],
-            ["mount", root_part, GENTOO_ROOT],
-        ]
+        run_cmd(["parted", cfg.target_disk, "--script", "mklabel", "msdos"], dry_run=dry_run)
+        run_cmd(
+            ["parted", cfg.target_disk, "--script", "mkpart", "primary", cfg.root_fs, "1MiB", "100%"],
+            dry_run=dry_run,
+        )
 
-    for cmd in cmds:
-        run_cmd(cmd, dry_run)
+        # Handle LUKS encryption
+        if cfg.use_luks and cfg.luks_password:
+            luks_base_partition = root_part
+            actual_root_device = setup_luks(root_part, cfg.luks_password, dry_run)
+        else:
+            actual_root_device = root_part
+
+        # Format and mount
+        run_cmd(["mkdir", "-p", GENTOO_ROOT], dry_run=dry_run)
+
+        if cfg.root_fs == "btrfs" and cfg.btrfs_subvolumes:
+            format_btrfs_with_subvolumes(actual_root_device, dry_run=dry_run)
+            mount_btrfs_subvolumes(actual_root_device, dry_run=dry_run)
+        elif cfg.root_fs == "btrfs":
+            run_cmd(["mkfs.btrfs", "-f", actual_root_device], dry_run=dry_run)
+            run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
+        elif cfg.root_fs == "xfs":
+            run_cmd(["mkfs.xfs", "-f", actual_root_device], dry_run=dry_run)
+            run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
+        else:  # ext4 default
+            run_cmd(["mkfs.ext4", actual_root_device], dry_run=dry_run)
+            run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
+
+    # Generate crypttab if LUKS was used
+    if cfg.use_luks and luks_base_partition:
+        generate_crypttab(cfg, luks_base_partition, dry_run=dry_run)
+
+    # Store boot partition for fstab generation
+    if cfg.use_uefi:
+        cfg.boot_partition = boot_part
 
 
 def install_stage3(cfg: GentooInstallConfig, dry_run: bool) -> None:
@@ -1659,20 +2386,28 @@ def configure_base_system(cfg: GentooInstallConfig, dry_run: bool) -> None:
             accept_license = os.environ.get("GENTOO_ACCEPT_LICENSE", "-* @FREE @BINARY-REDISTRIBUTABLE")
             f.write(f"ACCEPT_LICENSE=\"{accept_license}\"\\n")
 
-    # --- select best Gentoo mirrors using mirrorselect, if available ---
-    print("[STEP] Selecting Gentoo mirrors (if mirrorselect is installed)")
-    try:
-        result = run_cmd_capture(["mirrorselect", "-D", "-s4", "-o"])
-        mirrors_snippet = result.stdout.strip()
-        if mirrors_snippet:
-            print("[INFO] mirrorselect output:")
-            for line in mirrors_snippet.splitlines():
-                print("   ", line)
-            if not dry_run:
-                with open(make_conf_path, "a", encoding="utf-8") as f:
-                    f.write("\n" + mirrors_snippet + "\n")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] mirrorselect not available or failed: {exc!r}")
+    # --- select best Gentoo mirrors using mirrorselect, if explicitly requested ---
+    # By default we skip automatic mirror selection to avoid long-running or
+    # interactive mirrorselect calls on slow or offline networks. If you want
+    # this behaviour, set GENTOO_USE_MIRRORSELECT=1 in the environment before
+    # running the installer, then run mirrorselect in non-interactive mode.
+    use_mirrorselect = os.environ.get("GENTOO_USE_MIRRORSELECT") == "1"
+    if use_mirrorselect:
+        print("[STEP] Selecting Gentoo mirrors via mirrorselect (requested by env)")
+        try:
+            result = run_cmd_capture(["mirrorselect", "-D", "-s4", "-o"])
+            mirrors_snippet = result.stdout.strip()
+            if mirrors_snippet:
+                print("[INFO] mirrorselect output:")
+                for line in mirrors_snippet.splitlines():
+                    print("   ", line)
+                if not dry_run:
+                    with open(make_conf_path, "a", encoding="utf-8") as f:
+                        f.write("\n" + mirrors_snippet + "\n")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] mirrorselect not available or failed: {exc!r}")
+    else:
+        print("[INFO] Skipping automatic mirror selection. You can run mirrorselect inside the chroot later if desired.")
 
     # --- ensure main Gentoo repository configuration exists ---
     repos_src = os.path.join(GENTOO_ROOT, "usr", "share", "portage", "config", "repos.conf")
@@ -1891,9 +2626,23 @@ def finalize_install(cfg: GentooInstallConfig, dry_run: bool) -> None:
         run_in_chroot(["systemctl", "enable", "NetworkManager"], dry_run=dry_run)
         if cfg.network_mode == "nm_iwd":
             run_in_chroot(["systemctl", "enable", "iwd"], dry_run=dry_run)
+    elif cfg.network_mode == "static":
+        # Static IP configuration with systemd-networkd
+        configure_static_network(cfg, dry_run=dry_run)
+        run_in_chroot(["systemctl", "enable", "systemd-networkd"], dry_run=dry_run)
+        run_in_chroot(["systemctl", "enable", "systemd-resolved"], dry_run=dry_run)
 
     # Basic time sync service for systemd-based systems.
     run_in_chroot(["systemctl", "enable", "systemd-timesyncd"], dry_run=dry_run)
+
+    # --- Initramfs regeneration (if using LUKS or btrfs with dracut) ---
+    needs_dracut = cfg.use_luks or cfg.root_fs == "btrfs"
+    gen = cfg.initramfs_generator
+    if gen == "auto":
+        gen = "dracut" if needs_dracut else None
+
+    if gen == "dracut" and needs_dracut:
+        generate_initramfs_dracut(cfg, dry_run=dry_run)
 
     # Swap is already in fstab; we just log it here.
     if cfg.swap_partition:
@@ -1904,12 +2653,20 @@ def finalize_install(cfg: GentooInstallConfig, dry_run: bool) -> None:
 
 def run_install(cfg: GentooInstallConfig, dry_run: bool) -> None:
     print("\n=== Starting installation pipeline ===")
+
+    # Pre-install hook
+    run_hook(cfg.pre_install_hook, "pre-install", cfg, dry_run)
+
     mount_target(cfg, dry_run=dry_run)
     install_stage3(cfg, dry_run=dry_run)
     configure_base_system(cfg, dry_run=dry_run)
     install_bootloader(cfg, dry_run=dry_run)
     install_desktop_environment(cfg, dry_run=dry_run)
     finalize_install(cfg, dry_run=dry_run)
+
+    # Post-install hook
+    run_hook(cfg.post_install_hook, "post-install", cfg, dry_run)
+
     print("\n=== Pipeline finished ===")
     if dry_run:
         print("Note: this was a dry-run. No real changes were made.")
