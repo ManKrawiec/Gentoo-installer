@@ -339,7 +339,24 @@ def run_cmd(cmd: List[str], dry_run: bool) -> None:
     if dry_run:
         return
 
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Command not found: {cmd[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Command failed (exit {exc.returncode}): {printable}") from exc
+
+
+def run_mkfs_vfat(path: str, dry_run: bool) -> None:
+    """Create FAT32 filesystem using available mkfs binary."""
+
+    if shutil.which("mkfs.vfat"):
+        run_cmd(["mkfs.vfat", "-F32", path], dry_run=dry_run)
+        return
+    if shutil.which("mkfs.fat"):
+        run_cmd(["mkfs.fat", "-F32", path], dry_run=dry_run)
+        return
+    raise RuntimeError("Neither mkfs.vfat nor mkfs.fat is available (install dosfstools).")
 
 
 def run_cmd_capture(cmd: List[str]) -> subprocess.CompletedProcess:
@@ -2161,7 +2178,7 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
                     elif fs == "xfs":
                         run_cmd(["mkfs.xfs", "-f", path], dry_run=dry_run)
                     elif fs == "vfat":
-                        run_cmd(["mkfs.vfat", "-F32", path], dry_run=dry_run)
+                        run_mkfs_vfat(path, dry_run=dry_run)
 
         print("Using existing partitions (manual mode); partition table will NOT be modified.")
 
@@ -2227,7 +2244,7 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
         run_cmd(["udevadm", "settle"], dry_run=dry_run)
 
         # Format boot partition
-        run_cmd(["mkfs.vfat", "-F32", boot_part], dry_run=dry_run)
+        run_mkfs_vfat(boot_part, dry_run=dry_run)
 
         # Handle LUKS encryption
         if cfg.use_luks and cfg.luks_password:
