@@ -1,36 +1,59 @@
-# Gentoo Installer (CLI)
+# Gentoo Installer
 
-**Gentoo Installer** is a simple **non-graphical Gentoo Linux installer**, inspired by **archinstall**.
+Text installer for Gentoo Linux inspired by `archinstall`.
 
-This project is **open-source** and was created for educational and experimental purposes.
+## Current status
 
-## Important warning
-⚠️ **This installer has NOT been tested**.  
-⚠️ You may encounter **bugs**, **missing features**, or **unexpected behavior**.  
-⚠️ Use **at your own risk**.
+The installer is usable but still evolving.  
+Default mode is **dry-run** (safe): it prints planned commands and does not execute destructive actions.
 
-## Features
-- 🖥️ Text-based (CLI) installer  
-- 🔧 Inspired by archinstall  
-- 🧱 Designed for Gentoo Linux  
-- 🆓 Open Source  
-- 🧪 Hobby / educational project  
+Supported high-level flow:
+- amd64 stage3 variants: `systemd`, `openrc`, `musl`, `hardened` (best tested: `systemd`, `openrc`)
+- disk mode: `auto` (wipe and create layout) and `manual` (reuse existing partitions)
+- filesystems: `ext4`, `btrfs`, `xfs`
+- optional LUKS on root
+- kernel modes: `dist-kernel`, `genkernel`, `manual`
+- bootloaders: `grub`, `systemd-boot` (`systemd-boot` requires UEFI + systemd variant)
+- network: copy/manual, NetworkManager, static config (systemd-networkd or OpenRC netifrc)
 
-## Project status
-🚧 This project is in a **very early development stage**.  
-Not intended for daily or production use.
+## Quick start
 
-## License
-This is an **open-source** project.  
-See the repository for license details.
+Run in dry-run:
 
-## TODO / Roadmap
+```bash
+python3 gentoo_install.py
+```
 
-### 🇬🇧 English
-- [ ] Basic CLI menu
-- [ ] Disk selection and partitioning
-- [ ] Gentoo base system installation
-- [ ] fstab configuration
-- [ ] User and root password setup
-- [ ] Error handling
-- [ ] Virtual machine testing
+Run real installation (dangerous):
+
+```bash
+sudo python3 gentoo_install.py --execute
+```
+
+## Stage3 source
+
+Source resolution order:
+1. `stage3_source` from TUI/config
+2. `GENTOO_STAGE3_TARBALL` environment variable
+3. auto-download latest stage3 from configured Gentoo mirror
+
+So you can install without manually finding a stage3 URL.
+
+## Config files
+
+CLI supports saving/loading config and credentials:
+
+```bash
+python3 gentoo_install.py --save-config /root/gentoo_config.json --save-creds /root/gentoo_creds.json
+python3 gentoo_install.py --config /root/gentoo_config.json --creds /root/gentoo_creds.json --execute
+```
+
+## Important warnings
+
+- `auto` disk mode destroys data on selected disk.
+- This is not yet a full replacement for every handbook scenario.
+- Always test in VM before running on hardware.
+
+## Checklist
+
+Implementation coverage and known constraints: [`INSTALL_CHECKLIST.md`](INSTALL_CHECKLIST.md).
