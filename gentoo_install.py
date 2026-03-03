@@ -284,6 +284,7 @@ FILESYSTEMS: list[str] = [
     "ext4",
     "btrfs",
     "xfs",
+    "f2fs",
 ]
 
 STAGE3_VARIANTS: list[str] = [
@@ -340,11 +341,19 @@ def run_cmd(cmd: List[str], dry_run: bool) -> None:
         return
 
     try:
-        subprocess.run(cmd, check=True)
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
     except FileNotFoundError as exc:
         raise RuntimeError(f"Command not found: {cmd[0]}") from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"Command failed (exit {exc.returncode}): {printable}") from exc
+    if proc.returncode != 0:
+        tail_out = "\n".join((proc.stdout or "").strip().splitlines()[-4:])
+        tail_err = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
+        details = []
+        if tail_out:
+            details.append(f"stdout:\n{tail_out}")
+        if tail_err:
+            details.append(f"stderr:\n{tail_err}")
+        suffix = ("\n" + "\n".join(details)) if details else ""
+        raise RuntimeError(f"Command failed (exit {proc.returncode}): {printable}{suffix}")
 
 
 def run_mkfs_vfat(path: str, dry_run: bool) -> None:
@@ -357,6 +366,49 @@ def run_mkfs_vfat(path: str, dry_run: bool) -> None:
         run_cmd(["mkfs.fat", "-F32", path], dry_run=dry_run)
         return
     raise RuntimeError("Neither mkfs.vfat nor mkfs.fat is available (install dosfstools).")
+
+
+def ensure_not_mounted(path: str, dry_run: bool) -> None:
+    """Fail fast if formatting target is currently mounted."""
+
+    if dry_run:
+        return
+    probe = subprocess.run(["findmnt", "-rn", "-S", path], check=False, capture_output=True, text=True)
+    if probe.returncode == 0 and probe.stdout.strip():
+        raise RuntimeError(f"Refusing to format mounted partition: {path} (unmount it first).")
+
+
+def format_partition(path: str, fs: str, dry_run: bool) -> None:
+    """Format partition with selected filesystem keyword."""
+
+    key = (fs or "").strip().lower()
+    ensure_not_mounted(path, dry_run=dry_run)
+
+    if key in {"ext4"}:
+        run_cmd(["mkfs.ext4", path], dry_run=dry_run)
+        return
+    if key in {"btrfs"}:
+        run_cmd(["mkfs.btrfs", "-f", path], dry_run=dry_run)
+        return
+    if key in {"xfs"}:
+        run_cmd(["mkfs.xfs", "-f", path], dry_run=dry_run)
+        return
+    if key in {"vfat", "fat32", "efi"}:
+        run_mkfs_vfat(path, dry_run=dry_run)
+        return
+    if key in {"swap"}:
+        run_cmd(["mkswap", path], dry_run=dry_run)
+        return
+    if key in {"f2fs"}:
+        run_cmd(["mkfs.f2fs", "-f", path], dry_run=dry_run)
+        return
+    if key in {"exfat"}:
+        run_cmd(["mkfs.exfat", path], dry_run=dry_run)
+        return
+    if key in {"ntfs"}:
+        run_cmd(["mkfs.ntfs", "-F", path], dry_run=dry_run)
+        return
+    raise RuntimeError(f"Unsupported filesystem format flag: {fs}")
 
 
 def run_cmd_capture(cmd: List[str]) -> subprocess.CompletedProcess:
@@ -1303,7 +1355,13 @@ def _tui_partition_menu(stdscr, part: dict, cfg: GentooInstallConfig) -> None:
         "Set as /boot (EFI or boot)",
         "Set as swap",
         "Mark for format as ext4",
+        "Mark for format as btrfs",
+        "Mark for format as xfs",
         "Mark for format as vfat (EFI)",
+        "Mark for format as exfat",
+        "Mark for format as f2fs",
+        "Mark for format as ntfs",
+        "Mark for format as swap",
         "Clear format flag",
         "Cancel",
     ]
@@ -1341,9 +1399,27 @@ def _tui_partition_menu(stdscr, part: dict, cfg: GentooInstallConfig) -> None:
             elif choice.startswith("Mark for format as ext4"):
                 if path:
                     cfg.format_partitions[path] = "ext4"
+            elif choice.startswith("Mark for format as btrfs"):
+                if path:
+                    cfg.format_partitions[path] = "btrfs"
+            elif choice.startswith("Mark for format as xfs"):
+                if path:
+                    cfg.format_partitions[path] = "xfs"
             elif choice.startswith("Mark for format as vfat"):
                 if path:
                     cfg.format_partitions[path] = "vfat"
+            elif choice.startswith("Mark for format as exfat"):
+                if path:
+                    cfg.format_partitions[path] = "exfat"
+            elif choice.startswith("Mark for format as f2fs"):
+                if path:
+                    cfg.format_partitions[path] = "f2fs"
+            elif choice.startswith("Mark for format as ntfs"):
+                if path:
+                    cfg.format_partitions[path] = "ntfs"
+            elif choice.startswith("Mark for format as swap"):
+                if path:
+                    cfg.format_partitions[path] = "swap"
             elif choice.startswith("Clear format flag"):
                 if path and path in cfg.format_partitions:
                     del cfg.format_partitions[path]
@@ -2171,14 +2247,7 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
                     # Skip root if using LUKS - it will be formatted on the mapper
                     if cfg.use_luks and path == cfg.root_partition:
                         continue
-                    if fs == "ext4":
-                        run_cmd(["mkfs.ext4", path], dry_run=dry_run)
-                    elif fs == "btrfs":
-                        run_cmd(["mkfs.btrfs", "-f", path], dry_run=dry_run)
-                    elif fs == "xfs":
-                        run_cmd(["mkfs.xfs", "-f", path], dry_run=dry_run)
-                    elif fs == "vfat":
-                        run_mkfs_vfat(path, dry_run=dry_run)
+                    format_partition(path, fs, dry_run=dry_run)
 
         print("Using existing partitions (manual mode); partition table will NOT be modified.")
 
@@ -2200,12 +2269,7 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
             # Format if root_partition was marked for formatting
             if cfg.root_partition in cfg.format_partitions:
                 fs = cfg.format_partitions[cfg.root_partition]
-                if fs == "ext4":
-                    run_cmd(["mkfs.ext4", actual_root_device], dry_run=dry_run)
-                elif fs == "btrfs":
-                    run_cmd(["mkfs.btrfs", "-f", actual_root_device], dry_run=dry_run)
-                elif fs == "xfs":
-                    run_cmd(["mkfs.xfs", "-f", actual_root_device], dry_run=dry_run)
+                format_partition(actual_root_device, fs, dry_run=dry_run)
             run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
 
         if cfg.boot_partition:
@@ -2264,6 +2328,9 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
         elif cfg.root_fs == "xfs":
             run_cmd(["mkfs.xfs", "-f", actual_root_device], dry_run=dry_run)
             run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
+        elif cfg.root_fs == "f2fs":
+            run_cmd(["mkfs.f2fs", "-f", actual_root_device], dry_run=dry_run)
+            run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
         else:  # ext4 default
             run_cmd(["mkfs.ext4", actual_root_device], dry_run=dry_run)
             run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
@@ -2303,6 +2370,9 @@ def prepare_disks(cfg: GentooInstallConfig, dry_run: bool) -> None:
             run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
         elif cfg.root_fs == "xfs":
             run_cmd(["mkfs.xfs", "-f", actual_root_device], dry_run=dry_run)
+            run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
+        elif cfg.root_fs == "f2fs":
+            run_cmd(["mkfs.f2fs", "-f", actual_root_device], dry_run=dry_run)
             run_cmd(["mount", actual_root_device, GENTOO_ROOT], dry_run=dry_run)
         else:  # ext4 default
             run_cmd(["mkfs.ext4", actual_root_device], dry_run=dry_run)
