@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 from typing import Dict, List
 
 
@@ -366,6 +367,34 @@ def run_mkfs_vfat(path: str, dry_run: bool) -> None:
         run_cmd(["mkfs.fat", "-F32", path], dry_run=dry_run)
         return
     raise RuntimeError("Neither mkfs.vfat nor mkfs.fat is available (install dosfstools).")
+
+
+def download_file(url: str, dest_path: str, dry_run: bool) -> None:
+    """Download file using wget/curl/urllib fallback."""
+
+    if dry_run:
+        logging.info("[CMD] (dry-run): download %s -> %s", url, dest_path)
+        return
+
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+
+    # Prefer system tools for resume support.
+    if shutil.which("wget"):
+        run_cmd(["wget", "-c", "-O", dest_path, url], dry_run=False)
+        return
+    if shutil.which("curl"):
+        run_cmd(["curl", "-fL", "--retry", "3", "-o", dest_path, url], dry_run=False)
+        return
+
+    # Fallback to urllib when neither wget nor curl is available.
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp, open(dest_path, "wb") as out:
+            shutil.copyfileobj(resp, out)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Failed to download {url}. Network/DNS may be unavailable. "
+            "Provide local stage3 path or fix network in live environment.",
+        ) from exc
 
 
 def ensure_not_mounted(path: str, dry_run: bool) -> None:
@@ -804,8 +833,6 @@ def get_latest_stage3_url(mirror: str, arch: str = "amd64", variant: str = "syst
 
     Parses the latest-stage3-<arch>-<variant>.txt file to get the filename.
     """
-    import urllib.request
-
     # Construct the URL to the latest file
     # e.g. https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-systemd.txt
     latest_url = f"{mirror}/releases/{arch}/autobuilds/latest-stage3-{arch}-{variant}.txt"
@@ -861,13 +888,17 @@ def download_stage3(
         print("[INFO] Dry-run: not downloading.")
         return dest_path
 
-    run_cmd(["wget", "-c", "-O", dest_path, url], dry_run=False)
+    try:
+        download_file(url, dest_path, dry_run=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] Stage3 download failed: {exc!r}")
+        return None
 
     # Optionally download and verify GPG signature
     asc_url = url + ".asc"
     asc_path = dest_path + ".asc"
     try:
-        run_cmd(["wget", "-c", "-O", asc_path, asc_url], dry_run=False)
+        download_file(asc_url, asc_path, dry_run=False)
         print("[INFO] GPG signature downloaded. Manual verification recommended.")
     except Exception:
         print("[WARN] Could not download GPG signature.")
@@ -2407,7 +2438,7 @@ def install_stage3(cfg: GentooInstallConfig, dry_run: bool) -> None:
         if source.startswith("http://") or source.startswith("https://"):
             dest = os.path.join("/tmp", os.path.basename(source) or "gentoo-stage3.tar.xz")
             print(f"[STEP] Downloading stage3 from {source} to {dest}")
-            run_cmd(["wget", "-O", dest, source], dry_run=dry_run)
+            download_file(source, dest, dry_run=dry_run)
             tarball = dest
     else:
         print("[INFO] No explicit stage3 source provided; trying automatic latest stage3 download.")
